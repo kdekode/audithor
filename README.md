@@ -1,4 +1,4 @@
-# Audithor 0.8.0
+# Audithor 0.8.1
 
 Creado por **steev anderson**. Inspección local de logs Linux/Plesk, en consola y sin dependencias de Python externas. Requiere Python 3.9+ y zonas horarias del sistema. No usa idxo-security ni su instalador.
 
@@ -27,7 +27,11 @@ Desde la carpeta del script:
 python3 -I -B audithor.py --yesterday
 ```
 
-Analiza un dominio y muestra su resumen; al terminar cinco, espera **`start` + Enter** para los siguientes cinco. Enter solo no inicia más trabajo; `q` termina y muestra el resumen de lo analizado. **No ordena antes de analizar**: el resumen final se prepara con los contadores acumulados, sin releer logs.
+Sin indicar un dominio, muestra una **tabla con una fila por dominio**, disponible en cuanto termina su lectura. Columnas: DOMINIO, PETICIONES, MiB, BOTS %, HUM. %, DESC. %, 4xx (#), 5xx (#), PICO/MIN y ESTADO. HUM. significa humano probable; DESC. es desconocido, no se suma a humanos. No inventa páginas/usuarios únicos ni considera que todo lo que no parece bot sea humano.
+
+ESTADO usa REV:n para el número de umbrales activados, M para muestra, A para avisos adicionales y SIN FECHA cuando no se observaron accesos de la fecha. Si no se activan umbrales, muestra el volumen orientativo del pico (BAJA/MODERADA/ALTA). Los nombres largos se abrevian solo en la tabla. La tabla requiere una terminal ancha, de unos 126 caracteres; el detalle por dominio conserva el nombre completo, explicaciones, archivos, fechas, rankings y avisos.
+
+Al terminar cinco, espera **`start` + Enter** para los siguientes cinco. Enter solo no inicia más trabajo; `q` termina y muestra el resumen de lo analizado. **No ordena antes de analizar**: el resumen final se prepara con los contadores acumulados, sin releer logs. El indicador temporal de lectura se escribe en stderr solo si es terminal, para mantener limpias las filas.
 
 ```sh
 python3 -I -B audithor.py                       # muestra de hoy
@@ -122,7 +126,7 @@ El diagnóstico no abre logs. En `time -v`, `Maximum resident set size` indica e
 
 ## Verificación
 
-Pruebas locales en Windows/Python 3.14 para selección histórica Apache/nginx, archivos rápidos HTTP/HTTPS, cola reciente, límites, fechas, parser, filtros, cardinalidad, señales, espera explícita de `--full`, continuidad gzip, tandas con `start` y HTML escapado/acotado. Las pruebas de descriptores/enlaces/permisos reales requieren Linux y se omiten en este entorno. No se ha validado esta nueva revisión en tu servidor.
+Pruebas locales en Windows/Python 3.14 para selección histórica Apache/nginx, archivos rápidos HTTP/HTTPS, cola reciente, límites, fechas, parser, filtros, cardinalidad, señales, espera explícita de `--full`, continuidad gzip, tandas con `start`, filas alineadas emitidas antes del siguiente dominio y HTML escapado/acotado. Las pruebas de descriptores/enlaces/permisos reales requieren Linux y se omiten en este entorno. No se ha validado esta nueva revisión en tu servidor.
 
 Fixture local de 12 000 accesos (1 356 000 bytes), con lector de archivos adaptado a Windows y sin medir presión real del host: **8,289 s transcurridos y 0,812 s CPU**. Es una medida de esa prueba, no una promesa de velocidad/RAM en producción. Verifica el comportamiento de regulación sin la antigua pausa fija por línea.
 

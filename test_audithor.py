@@ -239,7 +239,7 @@ class Tests(unittest.TestCase):
         def show(domain, *args):
             events.append('show ' + domain)
         args = type('Args', (), {'gentle': True, 'sample': False})()
-        with patch.object(a, 'wait_for_capacity'), patch.object(a, 'analyze', side_effect=analyze), patch.object(a, 'show', side_effect=show), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(a, 'wait_for_capacity'), patch.object(a, 'analyze', side_effect=analyze), patch.object(a, 'show_overview_row', side_effect=show), contextlib.redirect_stdout(io.StringIO()):
             a.collect_ranked(0, ['a.com', 'b.com'], None, None, args)
         self.assertEqual(events, ['analyze a.com', 'show a.com', 'analyze b.com', 'show b.com'])
 
@@ -247,7 +247,7 @@ class Tests(unittest.TestCase):
         result = dict(total=10, bytes=100, earliest=None, latest=None, read=100,
                       notes=set(), counts=collections.Counter())
         args = type('Args', (), {'gentle': True, 'sample': False})()
-        with patch.object(a, 'wait_for_capacity'), patch.object(a, 'analyze', side_effect=[result, KeyboardInterrupt()]), patch.object(a, 'show'), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(a, 'wait_for_capacity'), patch.object(a, 'analyze', side_effect=[result, KeyboardInterrupt()]), patch.object(a, 'show_overview_row'), contextlib.redirect_stdout(io.StringIO()):
             rows = a.collect_ranked(0, ['a.com', 'b.com'], None, None, args)
         self.assertEqual([domain for domain, _ in rows], ['a.com'])
 
@@ -262,7 +262,7 @@ class Tests(unittest.TestCase):
             return 'start' if events.count('prompt') == 1 else 'q'
         args = type('Args', (), dict(gentle=True, sample=False, once=False, report=False, send=False))()
         domains = [f'd{n}.com' for n in range(12)]
-        with patch.object(a, 'wait_for_capacity'), patch.object(a, 'analyze', side_effect=analyze), patch.object(a, 'show'), patch.object(a.sys.stdin, 'isatty', return_value=True), patch('builtins.input', side_effect=command), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(a, 'wait_for_capacity'), patch.object(a, 'analyze', side_effect=analyze), patch.object(a, 'show_overview_row'), patch.object(a.sys.stdin, 'isatty', return_value=True), patch('builtins.input', side_effect=command), contextlib.redirect_stdout(io.StringIO()):
             rows = a.collect_ranked(0, domains, None, None, args)
         self.assertEqual(events[:7], domains[:5] + ['prompt', 'd5.com'])
         self.assertEqual(len(rows), 10)
@@ -382,6 +382,23 @@ class Tests(unittest.TestCase):
         self.assertNotIn('CPU diaria', text)
         self.assertLessEqual(max(map(len, text.splitlines())), 90)
         self.assertEqual(a.PAGE_SIZE, 5)
+
+    def test_overview_is_one_aligned_row_without_detail_card(self):
+        result = dict(total=1920, bytes=50*1048576, read=1000, rapid=True,
+                      counts=collections.Counter(bot=100, probable=1400, unknown=420),
+                      notes={'VISTA RÁPIDA: muestra'}, http4=38, http5=0, peak=355)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            a.show_overview_header()
+            a.show_overview_row('example.com', result)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(len(lines[1]), len(lines[3]))
+        self.assertIn('example.com', lines[3])
+        self.assertIn('1,920', lines[3])
+        self.assertIn('MODERADA/M', lines[3])
+        self.assertIn('DESC. %', lines[1])
+        self.assertNotIn('QUÉ SE HA MEDIDO', output.getvalue())
 
     def test_wait_resumes_without_raising_load_limit(self):
         with patch.object(a, 'pressure', side_effect=['Host ocupado', 'Host ocupado', None]), patch.object(a.time, 'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()):

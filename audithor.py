@@ -28,7 +28,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 5
-VERSION = '0.8.0'
+VERSION = '0.8.1'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -730,6 +730,59 @@ def review_key(row):
             -result.get('http5', 0), -result.get('http4', 0), -result['total'], domain)
 
 
+OVERVIEW_COLUMNS = (
+    ('DOMINIO', 32), ('PETICIONES', 10), ('MiB', 9), ('BOTS %', 7),
+    ('HUM. %', 7), ('DESC. %', 7), ('4xx (#)', 7), ('5xx (#)', 7),
+    ('PICO/MIN', 8), ('ESTADO', 14),
+)
+
+
+def overview_line(values):
+    cells = []
+    for index, (value, (_, width)) in enumerate(zip(values, OVERVIEW_COLUMNS)):
+        text = clean(value, 1000)
+        if len(text) > width:
+            text = text[:width-3] + '...'
+        cells.append(text.ljust(width) if index in (0, 9) else text.rjust(width))
+    return '  '.join(cells)
+
+
+def show_overview_header():
+    print('\n' + overview_line([title for title, _ in OVERVIEW_COLUMNS]))
+    print('  '.join('-' * width for _, width in OVERVIEW_COLUMNS), flush=True)
+
+
+def show_overview_row(domain, result):
+    total = result['total']
+    known = bool(result.get('read', 0))
+    percent = lambda key: f'{100*result["counts"][key]/total:.1f}' if total else 'N/D'
+    flags = []
+    if not known or not total:
+        flags.append('SIN FECHA')
+    elif signals(result):
+        flags.append('REV:' + str(len(signals(result))))
+    else:
+        flags.append(activity_level(result.get('peak', 0)))
+    if result.get('rapid'):
+        flags.append('M')
+    ordinary = ('VISTA RÁPIDA:', 'Se omiten ', 'Vista rápida: cola', 'Límite de tiempo/bytes', 'Quedan archivos sin leer')
+    if any(not note.startswith(ordinary) for note in result['notes']):
+        flags.append('A')
+    print(overview_line((domain, f'{total:,}' if known else 'N/D',
+                         f'{result["bytes"]/1048576:.2f}' if known else 'N/D',
+                         percent('bot'), percent('probable'), percent('unknown'),
+                         f'{result.get("http4", 0):,}' if total else 'N/D',
+                         f'{result.get("http5", 0):,}' if total else 'N/D',
+                         f'{result.get("peak", 0):,}' if total else 'N/D', '/'.join(flags))), flush=True)
+
+
+def overview_progress(text=''):
+    # Mantener las filas limpias; el indicador temporal solo se usa en terminal.
+    if sys.stderr.isatty():
+        sys.stderr.write('\r' + ' ' * 110 + '\r' + clean(text, 100))
+        sys.stderr.flush()
+
+
 def show_review_page(rows, start=1):
     table(('Nº', 'DOMINIO', 'REVISIÓN', '4xx', '5xx', 'SENS.4xx'), [
         (str(number), domain,
@@ -917,11 +970,17 @@ def finish_audit(args, rows):
 
 def collect_ranked(root, domains, day, zone, args):
     rows = []
-    print('\nMostraré cada dominio al terminar su lectura y un resumen ordenado al final.', flush=True)
+    print('\nUna fila por dominio. Peticiones/porcentajes se refieren a los accesos leídos de la fecha.')
+    print('MiB = contenido enviado; HUM. = humano probable; DESC. = desconocido; 4xx/5xx = número de respuestas.')
+    print('ESTADO: REV:n = umbrales activados; M = muestra, no total diario; A = avisos; SIN FECHA = sin accesos de la fecha.')
+    print('BAJA/MODERADA/ALTA = volumen orientativo del pico; no confirma ni descarta ataques.')
+    print('Para explicaciones, rutas, IP y avisos completos: ejecuta el comando indicando un dominio.')
     for number, domain in enumerate(domains, 1):
         try:
             if number > 1 and (number - 1) % PAGE_SIZE == 0 and not next_batch(args):
                 break
+            if (number - 1) % PAGE_SIZE == 0:
+                show_overview_header()
             if getattr(args, 'sample', False):
                 reason = pressure(args.gentle, rapid=True)
                 if reason:
@@ -929,16 +988,18 @@ def collect_ranked(root, domains, day, zone, args):
                     break
             else:
                 wait_for_capacity(args.gentle)
-            print(f'  [{number}/{len(domains)}] Leyendo {domain}…', flush=True)
+            overview_progress(f'[{number}/{len(domains)}] Leyendo {domain}…')
             result = analyze(root, domain, day, zone, args)
+            overview_progress()
             if getattr(args, 'audit', None):
                 args.audit.append(domain, result)
             summary = compact_summary(result)
             rows.append((domain, summary))
-            show(domain, day, summary)
+            show_overview_row(domain, summary)
             sys.stdout.flush()
             del result
         except KeyboardInterrupt:
+            overview_progress()
             print('\nLectura interrumpida: mostraré el resumen de los dominios ya terminados.', flush=True)
             break
     rows.sort(key=review_key)
