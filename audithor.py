@@ -26,6 +26,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 5
+VERSION = '0.6.0'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -161,16 +162,46 @@ def discover(root):
     return [name for name, _ in sorted(rows, key=lambda r: (-r[1], r[0]))]
 
 
+def wait_for_capacity(gentle=False):
+    """Esperar conservando el estado en memoria; no aumentar los umbrales."""
+    announced = False
+    next_notice = 0
+    while True:
+        reason = pressure(gentle)
+        if not reason:
+            if announced:
+                print('  Carga recuperada: continúo desde el mismo punto.', flush=True)
+            return
+        if time.monotonic() >= next_notice:
+            print('  PAUSA: ' + reason + ' Recompruebo cada 5 s; Ctrl+C para salir.', flush=True)
+            next_notice = time.monotonic() + 30
+            announced = True
+        time.sleep(5)
+
+
 class Budget:
-    def __init__(self, seconds, mib, gentle=False):
+    def __init__(self, seconds, mib, gentle=False, continuous=False):
         self.end = time.monotonic() + seconds
         self.maximum = mib * 1024 * 1024
         self.read = 0
         self.steps = 0
         self.pressure = None
         self.gentle = gentle
+        self.continuous = continuous
+        self.window_seconds = seconds
+        self.window_bytes = self.maximum
 
     def exhausted(self):
+        if self.continuous:
+            if self.steps % 100 == 0:
+                wait_for_capacity(self.gentle)
+            if self.read >= self.maximum or time.monotonic() >= self.end:
+                print(f'  Progreso: {self.read/1048576:.2f} MiB leídos; {self.steps:,} líneas/fragmentos. Continúo…', flush=True)
+                time.sleep(1)
+                wait_for_capacity(self.gentle)
+                self.end = time.monotonic() + self.window_seconds
+                self.maximum = self.read + self.window_bytes
+            return False
         if self.steps % 250 == 0:
             self.pressure = pressure(self.gentle)
         if self.pressure:
@@ -228,7 +259,8 @@ def scan(parent, name, budget, state):
                 remaining = initial.st_size - raw.tell() if not packed else 16384
                 if remaining <= 0:
                     break
-                cap = min(16384, remaining, budget.maximum - budget.read)
+                allowance = 16384 if budget.continuous else budget.maximum - budget.read
+                cap = min(16384, remaining, allowance)
                 line = stream.readline(cap)
                 if not line:
                     break
@@ -237,7 +269,7 @@ def scan(parent, name, budget, state):
                     state['notes'].add('Línea larga/incompleta o límite de lectura; cobertura parcial.')
                     # No analizar fragmentos como si fuesen peticiones completas.
                     while line and not line.endswith(b'\n') and not budget.exhausted():
-                        cap = min(16384, budget.maximum - budget.read)
+                        cap = 16384 if budget.continuous else min(16384, budget.maximum - budget.read)
                         line = stream.readline(cap)
                         budget.tick(len(line))
                     continue
@@ -377,14 +409,12 @@ def show_fail2ban(result, day):
 def signals(result):
     total = result['total']
     findings = []
-    if result.get('sensitive', 0) >= 20:
-        findings.append('Accesos a rutas sensibles: ' + str(result['sensitive']))
+    if result.get('sensitive4', 0) >= 20:
+        findings.append('Rutas sensibles con respuesta 4xx: ' + str(result['sensitive4']))
     if total >= 100 and result.get('http4', 0) / total >= .5:
         findings.append('Al menos 50% de respuestas 4xx')
     if total >= 20 and result.get('http5', 0) / total >= .1:
         findings.append('Al menos 10% de respuestas 5xx')
-    if result.get('peak', 0) >= 300:
-        findings.append('Pico observado de al menos 300 peticiones/minuto')
     return findings
 
 
@@ -393,11 +423,11 @@ def analyze(root, domain, day, zone, args):
                  bytes_urls=collections.Counter(), errors=collections.Counter(), statuses=collections.Counter(),
                  internal=collections.Counter(),
                  ip_counts=collections.Counter(), minutes=collections.Counter(), sensitive_urls=collections.Counter(),
-                 f2b_seen=set(), sensitive=0, http4=0, http5=0, peak=0,
+                 f2b_seen=set(), sensitive=0, sensitive4=0, http4=0, http5=0, peak=0, peak_minute=None,
                  total=0, bytes=0, invalid=0, earliest=None, latest=None)
     bans = getattr(args, 'bans', None)
     state['f2b_matches'] = 0 if bans and bans['day_seen'] else None
-    budget = Budget(args.seconds, args.max_mib, args.gentle)
+    budget = Budget(args.seconds, args.max_mib, args.gentle, continuous=not getattr(args, 'sample', False))
     try:
         fd = directory(domain + '/logs', root)
     except OSError as exc:
@@ -435,10 +465,13 @@ def analyze(root, domain, day, zone, args):
                     state['http5'] += int(status >= 500)
                     probe = bool(SENSITIVE.search(unquote(path)))
                     state['sensitive'] += int(probe)
+                    state['sensitive4'] += int(probe and 400 <= status < 500)
                     # Un día tiene <=1500 minutos con cambio horario; límite defensivo.
                     if minute in state['minutes'] or len(state['minutes']) < 1600:
                         state['minutes'][minute] += 1
-                        state['peak'] = max(state['peak'], state['minutes'][minute])
+                        if state['minutes'][minute] > state['peak']:
+                            state['peak'] = state['minutes'][minute]
+                            state['peak_minute'] = minute
                     if bans and ip in bans['ips']:
                         state['f2b_seen'].add(ip)
                     if args.domain:
@@ -500,7 +533,7 @@ def show(domain, day, result, detail=False):
     total = result['total']
     known = bool(result.get('read', 0))
     pct = lambda k: f"{100 * result['counts'][k] / total:.1f}%" if total else 'N/D'
-    count_pct = lambda n: f'{n:,} / {100*n/total:.1f}%' if total else 'N/D'
+    count_pct = lambda n: f'{n:,} ({100*n/total:.1f}% de las leídas)' if total else 'Sin accesos de la fecha'
     f2b = result.get('f2b_matches')
     print('\n' + '=' * 80)
     print(' ' + domain)
@@ -508,15 +541,34 @@ def show(domain, day, result, detail=False):
     if result.get('layer'):
         print(' Fuente de accesos: ' + result['layer'].upper() + ' (una sola capa)')
     print('=' * 80 + '\n')
-    table(('TRÁFICO', 'VALOR', 'SEÑALES', 'VALOR'), [
-        ('Peticiones', f'{total:,}' if known else 'N/D', 'HTTP 4xx', count_pct(result.get('http4', 0))),
-        ('Transferencia', f'{result["bytes"]/1048576:.2f} MiB' if known else 'N/D', 'HTTP 5xx', count_pct(result.get('http5', 0))),
-        ('Bots/automatización', pct('bot'), 'Rutas sensibles', f'{result.get("sensitive", 0):,}' if known else 'N/D'),
-        ('Humano probable', pct('probable'), 'Pico peticiones/min', f'{result.get("peak", 0):,}' if known else 'N/D'),
-        ('Desconocido', pct('unknown'), 'IP coincidentes F2B', f'{f2b:,}' if f2b is not None else 'N/D'),
-    ], (22, 14, 22, 14))
-    print('\n  F2B: IP vistas en esta web y con evento Ban en el servidor ese día.')
-    print('       Coincidencia; no demuestra que esta web originara el bloqueo.')
+    metrics = [
+        ('Peticiones de la fecha leídas', f'{total:,}' if known else 'N/D'),
+        ('Contenido enviado (según log)', f'{result["bytes"]/1048576:.2f} MiB' if known else 'N/D'),
+        ('Bots / automatización probable', pct('bot')),
+        ('Humano probable / desconocido', pct('probable') + ' / ' + pct('unknown')),
+        ('Respuestas 4xx (ej. 403 / 404)', count_pct(result.get('http4', 0))),
+        ('Respuestas 5xx (ej. 500 / 503)', count_pct(result.get('http5', 0))),
+        ('Accesos a rutas sensibles', f'{result.get("sensitive", 0):,}' if total else 'N/D'),
+        ('Pico en un minuto registrado', f'{result.get("peak", 0):,} peticiones' if total else 'N/D'),
+    ]
+    if detail:
+        metrics.append(('IP coincidentes con Fail2Ban', f'{f2b:,}' if f2b is not None else 'N/D'))
+    table(('QUÉ SE HA MEDIDO', 'RESULTADO'), metrics, (37, 37))
+    print('\n  Una petición es un recurso solicitado: página, imagen, CSS, API, etc.')
+    print('  El contenido enviado suma tamaños de respuesta; no mide RAM ni CPU.')
+    print('  4xx: solicitudes rechazadas/no encontradas. 5xx: errores del servidor.')
+    print('  Los porcentajes 4xx/5xx usan todas las peticiones leídas de esta fecha.')
+    peak = result.get('peak', 0)
+    if total:
+        level = 'BAJA' if peak < 60 else 'MODERADA' if peak < 600 else 'ALTA' if peak < 3000 else 'MUY ALTA'
+        print(f'\n  ACTIVIDAD {level}: pico observado de {peak:,}/min (~{peak/60:.1f}/s).')
+        if result.get('peak_minute'):
+            print('  Minuto del pico: ' + result['peak_minute'])
+        print('  Nivel orientativo por volumen; no compara con el historial de esta web.')
+        print('  Un pico alto puede ser normal. Incluye recursos y bots, no personas.')
+    if detail:
+        print('\n  F2B: IP vistas en esta web y con evento Ban en el servidor ese día.')
+        print('       Coincidencia; no demuestra que esta web originara el bloqueo.')
     findings = signals(result)
     if findings:
         print('\n  REVISAR · Indicadores orientativos; no confirman un ataque:')
@@ -558,8 +610,9 @@ def compact_summary(result):
     summary = {key: result[key] for key in ('total', 'bytes', 'earliest', 'latest')}
     summary['read'] = result.get('read', 0)
     summary['layer'] = result.get('layer')
-    for key in ('http4', 'http5', 'sensitive', 'peak'):
+    for key in ('http4', 'http5', 'sensitive', 'sensitive4', 'peak'):
         summary[key] = result.get(key, 0)
+    summary['peak_minute'] = result.get('peak_minute')
     summary['f2b_matches'] = result.get('f2b_matches')
     summary['counts'] = collections.Counter({key: result['counts'][key] for key in ('bot', 'probable', 'unknown')})
     notes = sorted(result['notes'])
@@ -569,30 +622,72 @@ def compact_summary(result):
     return summary
 
 
+def review_key(row):
+    domain, result = row
+    available = bool(result.get('read') and result['total'])
+    return (not available, -len(signals(result)), -result.get('sensitive4', 0),
+            -result.get('http5', 0), -result.get('http4', 0), -result['total'], domain)
+
+
+def show_review_page(rows, start=1):
+    table(('Nº', 'DOMINIO', 'REVISIÓN', '4xx', '5xx', 'SENS.4xx'), [
+        (str(number), domain,
+         ('Sin datos' if not result.get('read') or not result['total'] else
+          f'{len(signals(result))} señales' if signals(result) else 'Sin umbrales'),
+         str(result.get('http4', 0)) if result['total'] else 'N/D',
+         str(result.get('http5', 0)) if result['total'] else 'N/D',
+         str(result.get('sensitive4', 0)) if result['total'] else 'N/D')
+        for number, (domain, result) in enumerate(rows, start)
+    ], (3, 28, 12, 8, 8, 9))
+    for domain, result in rows:
+        findings = signals(result)
+        if findings:
+            print('\n  ' + domain + ':')
+            for finding in findings:
+                print('    - ' + finding)
+        if result['notes']:
+            print('  ' + domain + ': tiene avisos de lectura; revisa su informe anterior.')
+    print(flush=True)
+
+
 def collect_ranked(root, domains, day, zone, args):
     rows = []
-    print('\nPreparando ranking global: se leerán los dominios uno a uno antes de mostrar las tandas.', flush=True)
+    print('\nMostraré cada dominio al terminar su lectura y un resumen ordenado al final.', flush=True)
     for number, domain in enumerate(domains, 1):
-        reason = pressure(args.gentle)
-        if reason:
-            print(f'\nRanking incompleto: {reason}', flush=True)
+        try:
+            if getattr(args, 'sample', False):
+                reason = pressure(args.gentle)
+                if reason:
+                    print(f'\nRecorrido incompleto: {reason}', flush=True)
+                    break
+            else:
+                wait_for_capacity(args.gentle)
+            print(f'  [{number}/{len(domains)}] Leyendo {domain}…', flush=True)
+            result = analyze(root, domain, day, zone, args)
+            summary = compact_summary(result)
+            rows.append((domain, summary))
+            show(domain, day, summary)
+            sys.stdout.flush()
+            del result
+        except KeyboardInterrupt:
+            print('\nLectura interrumpida: mostraré el resumen de los dominios ya terminados.', flush=True)
             break
-        print(f'  [{number}/{len(domains)}] Leyendo {domain}…', flush=True)
-        result = analyze(root, domain, day, zone, args)
-        rows.append((domain, compact_summary(result)))
-        del result
-    # Peticiones descendentes; bytes desempatan, nombre estabiliza el orden.
-    # La falta de lectura se coloca al final, sin confundirla con tráfico cero.
-    rows.sort(key=lambda row: (not bool(row[1]['read']), -row[1]['total'], -row[1]['bytes'], row[0]))
-    print(f'\nRanking por peticiones OBSERVADAS: {len(rows)}/{len(domains)} dominios consultados.')
-    print('No mide CPU/RAM. Lecturas parciales o históricos ausentes pueden alterar el orden real.')
+    rows.sort(key=review_key)
+    print('\n' + '=' * 80)
+    print(f' RESUMEN FINAL · PRIORIDAD DE REVISIÓN · {len(rows)}/{len(domains)} dominios')
+    print('=' * 80)
+    print('Orden: más umbrales activados; después rutas sensibles con 4xx, 5xx y 4xx.')
+    print('El tráfico desempata. Sin accesos de la fecha: al final, sin valoración.')
+    print('No es una medición de ataques: incluye errores y accesos legítimos.')
+    print('Las lecturas parciales/avisos pueden alterar este orden.')
     if len(rows) < len(domains):
         print(f'{len(domains) - len(rows)} dominios pendientes; no están incluidos en el ranking.')
     return rows
 
 
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(description='Audithor — steev anderson. Logs Plesk, solo lectura, cinco dominios por tanda.')
+    parser = argparse.ArgumentParser(description='Audithor — steev anderson. Informes progresivos y resumen final de revisión.')
+    parser.add_argument('--version', action='version', version='Audithor ' + VERSION)
     parser.add_argument('domain', nargs='?', help='Dominio exacto para informe detallado')
     dates = parser.add_mutually_exclusive_group()
     dates.add_argument('--yesterday', action='store_true', help='Ayer en la zona horaria elegida')
@@ -602,11 +697,12 @@ def arguments(argv=None):
     parser.add_argument('--gzip', action='store_true', help='Incluir históricos comprimidos dentro del mismo presupuesto')
     parser.add_argument('--no-fail2ban', action='store_true', help='Omitir lectura del historial Fail2Ban')
     parser.add_argument('--fail2ban-log', default='/var/log/fail2ban.log', help='Archivo de historial Fail2Ban, sin modificarlo')
-    parser.add_argument('--seconds', type=int, default=30, help='Tiempo máximo por dominio (1–1800, defecto 30)')
-    parser.add_argument('--max-mib', type=int, default=64, help='Lectura máxima descomprimida por dominio (1–1024, defecto 64)')
-    parser.add_argument('--once', action='store_true', help='Mostrar solo el top 5; la vista global analiza antes todos los dominios')
+    parser.add_argument('--seconds', type=int, default=30, help='Segundos por tanda; límite total por dominio solo con --sample (1–1800)')
+    parser.add_argument('--max-mib', type=int, default=64, help='MiB descomprimidos por tanda; límite total solo con --sample (1–1024)')
+    parser.add_argument('--once', action='store_true', help='Mostrar solo cinco filas del resumen final; los informes progresivos se mantienen')
     parser.add_argument('--diagnose', action='store_true', help='Mostrar carga, CPU lógicas y memoria; sin analizar dominios')
     parser.add_argument('--gentle', action='store_true', help='Modo lento: pausa 10 ms/línea, umbral de carga 1 por CPU lógica')
+    parser.add_argument('--sample', action='store_true', help='Solo muestra acotada por dominio; sin esta opción continúa hasta acabar')
     args = parser.parse_args(argv)
     if args.domain and not DOMAIN.fullmatch(args.domain):
         parser.error('Dominio no válido. Usa su nombre ASCII exacto, sin URL ni rutas.')
@@ -652,34 +748,39 @@ def main(argv=None):
     except (AttributeError, ImportError, OSError, ValueError) as exc:
         raise RuntimeError('No se pudieron aplicar los límites locales: ' + str(exc))
     print(BANNER)
-    print(f'Fecha: {args.day} ({args.timezone}). Secuencial; {args.seconds}s/{args.max_mib} MiB por dominio; memoria virtual máxima 128 MiB.')
+    print('Audithor ' + VERSION)
+    print(f'Fecha: {args.day} ({args.timezone}). Secuencial; memoria virtual máxima 128 MiB.')
+    print(f'Tandas de {args.seconds}s/{args.max_mib} MiB. ' + ('MUESTRA limitada por dominio.' if args.sample else 'LECTURA CONTINUA: descansa y continúa hasta finalizar los archivos seleccionados.'))
     print('Solo lectura. Sin instalaciones, cron, procesos externos, conexiones de red ni cambios de permisos.')
     print('Bots y humanos son estimaciones. Las señales no confirman ataques.')
     if args.historical:
         print('Fecha histórica: gzip incluido automáticamente; prioridad a logs rotados.')
     if args.gentle:
         print('Modo lento: pausa de 10 ms por línea/fragmento (aprox. máximo 100/s); umbral 1 por CPU lógica.')
-    reason = pressure(args.gentle)
-    if reason:
-        raise RuntimeError(reason)
+    if args.sample:
+        reason = pressure(args.gentle)
+        if reason:
+            raise RuntimeError(reason)
+    else:
+        wait_for_capacity(args.gentle)
     root = directory(args.root)
     try:
         domains = [args.domain] if args.domain else discover(root)
         if not domains:
             print('No se encontraron dominios accesibles.')
             return 0
-        print('\nLeyendo historial Fail2Ban una sola vez…', flush=True)
-        args.bans = read_fail2ban(args)
-        show_fail2ban(args.bans, args.day)
+        args.bans = None
+        if args.domain:
+            print('\nLeyendo historial Fail2Ban…', flush=True)
+            args.bans = read_fail2ban(args)
+            show_fail2ban(args.bans, args.day)
         if args.domain:
             print('\nLeyendo ' + args.domain + '…', flush=True)
             show(args.domain, args.day, analyze(root, args.domain, args.day, args.zone, args), True)
             return 0
         rows = collect_ranked(root, domains, args.day, args.zone, args)
         for offset in range(0, len(rows), PAGE_SIZE):
-            for position, (domain, summary) in enumerate(rows[offset:offset+PAGE_SIZE], offset+1):
-                print(f'\nPuesto {position}')
-                show(domain, args.day, summary)
+            show_review_page(rows[offset:offset+PAGE_SIZE], offset+1)
             if offset + PAGE_SIZE >= len(rows) or args.once or not sys.stdin.isatty():
                 break
             if input(f'\nEnter: siguientes {PAGE_SIZE} | q + Enter: salir > ').strip().lower() in ('q', 'salir'):

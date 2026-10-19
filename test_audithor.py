@@ -141,12 +141,41 @@ class Tests(unittest.TestCase):
         self.assertTrue(all('urls' not in summary for _, summary in rows))
 
     def test_global_ranking_stops_when_host_pressure_rises(self):
-        args = type('Args', (), {'gentle': True})()
+        args = type('Args', (), {'gentle': True, 'sample': True})()
         output = io.StringIO()
         with patch.object(a, 'pressure', return_value='Host ocupado'), patch.object(a, 'analyze') as analyze, contextlib.redirect_stdout(output):
             self.assertEqual(a.collect_ranked(0, ['a.com', 'b.com'], None, None, args), [])
             analyze.assert_not_called()
         self.assertIn('2 dominios pendientes', output.getvalue())
+
+    def test_review_priority_is_not_traffic_ranking(self):
+        def item(domain, total, http4=0, http5=0, sensitive4=0):
+            return domain, dict(total=total, read=100, http4=http4, http5=http5, sensitive4=sensitive4)
+        rows = [item('busy.com', 100000), item('errors.com', 100, http5=20),
+                item('probes.com', 100, http4=70, sensitive4=40), item('empty.com', 0)]
+        rows.sort(key=a.review_key)
+        self.assertEqual([row[0] for row in rows], ['probes.com', 'errors.com', 'busy.com', 'empty.com'])
+
+    def test_domain_is_printed_before_next_domain_is_analyzed(self):
+        events = []
+        def analyze(root, domain, day, zone, args):
+            events.append('analyze ' + domain)
+            return dict(total=10, bytes=100, earliest=None, latest=None, read=100,
+                        notes=set(), counts=collections.Counter())
+        def show(domain, *args):
+            events.append('show ' + domain)
+        args = type('Args', (), {'gentle': True, 'sample': False})()
+        with patch.object(a, 'wait_for_capacity'), patch.object(a, 'analyze', side_effect=analyze), patch.object(a, 'show', side_effect=show), contextlib.redirect_stdout(io.StringIO()):
+            a.collect_ranked(0, ['a.com', 'b.com'], None, None, args)
+        self.assertEqual(events, ['analyze a.com', 'show a.com', 'analyze b.com', 'show b.com'])
+
+    def test_interruption_keeps_finished_domains_in_summary(self):
+        result = dict(total=10, bytes=100, earliest=None, latest=None, read=100,
+                      notes=set(), counts=collections.Counter())
+        args = type('Args', (), {'gentle': True, 'sample': False})()
+        with patch.object(a, 'wait_for_capacity'), patch.object(a, 'analyze', side_effect=[result, KeyboardInterrupt()]), patch.object(a, 'show'), contextlib.redirect_stdout(io.StringIO()):
+            rows = a.collect_ranked(0, ['a.com', 'b.com'], None, None, args)
+        self.assertEqual([domain for domain, _ in rows], ['a.com'])
 
     def test_internal_errors_no_raw_secrets(self):
         event = a.error_event(b'2026/10/19 12:30:00 [error] PHP Fatal error: password=secret')
@@ -178,8 +207,9 @@ class Tests(unittest.TestCase):
 
     def test_signals_are_separate_from_bot_percentage(self):
         self.assertEqual(a.signals(dict(total=1000, counts={'bot': 1000})), [])
-        findings = a.signals(dict(total=1000, http4=600, http5=150, sensitive=30, peak=400))
-        self.assertEqual(len(findings), 4)
+        findings = a.signals(dict(total=1000, http4=600, http5=150, sensitive4=30, peak=400))
+        self.assertEqual(len(findings), 3)
+        self.assertEqual(a.signals(dict(total=1000, peak=355)), [])
 
     def test_card_layout_has_no_unavailable_cpu_ram(self):
         result = dict(total=100, bytes=12345, counts=collections.Counter(bot=20, probable=80),
@@ -189,13 +219,48 @@ class Tests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             a.show('example.com', dt.date(2026, 10, 18), result)
         text = output.getvalue()
-        self.assertIn('TRÁFICO', text)
-        self.assertIn('HTTP 4xx', text)
-        self.assertIn('IP coincidentes F2B', text)
+        self.assertIn('QUÉ SE HA MEDIDO', text)
+        self.assertIn('Respuestas 4xx', text)
+        self.assertIn('25 (25.0% de las leídas)', text)
+        self.assertNotIn('F2B', text)
+        self.assertIn('ACTIVIDAD BAJA', text)
         self.assertNotIn('RAM diaria', text)
         self.assertNotIn('CPU diaria', text)
         self.assertLessEqual(max(map(len, text.splitlines())), 90)
         self.assertEqual(a.PAGE_SIZE, 5)
+
+    def test_wait_resumes_without_raising_load_limit(self):
+        with patch.object(a, 'pressure', side_effect=['Host ocupado', 'Host ocupado', None]), patch.object(a.time, 'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()):
+            a.wait_for_capacity(True)
+        self.assertEqual(sleep.call_count, 2)
+        sleep.assert_called_with(5)
+
+    def test_continuous_scan_keeps_position_across_batches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'log'
+            path.write_bytes(line() * 20)
+            @contextlib.contextmanager
+            def opening(parent, name):
+                with path.open('rb') as stream:
+                    yield stream
+            state = {'inodes': set(), 'notes': set()}
+            budget = a.Budget(30, 1, continuous=True)
+            budget.maximum = budget.window_bytes = len(line()) * 2
+            with patch.object(a, 'regular', opening), patch.object(a, 'pressure', return_value=None), patch.object(a.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+                rows = list(a.scan(0, 'log', budget, state))
+            self.assertEqual(rows, [line()] * 20)
+            self.assertEqual(budget.read, path.stat().st_size)
+            self.assertFalse(state['notes'])
+            # El gzip permanece abierto y no reinicia ni duplica eventos al descansar.
+            path.write_bytes(gzip.compress(line() * 20))
+            state = {'inodes': set(), 'notes': set()}
+            budget = a.Budget(30, 1, continuous=True)
+            budget.maximum = budget.window_bytes = len(line()) * 2
+            with patch.object(a, 'regular', opening), patch.object(a, 'pressure', return_value=None), patch.object(a.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+                rows = list(a.scan(0, 'log.gz', budget, state))
+            self.assertEqual(rows, [line()] * 20)
+            self.assertEqual(budget.read, len(line()) * 20)
+            self.assertFalse(state['notes'])
 
     def test_history_analysis_and_fail2ban_read_only_fixtures(self):
         # Adaptar openat en Windows para probar el recorrido de datos completo.
