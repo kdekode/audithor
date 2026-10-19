@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from unittest.mock import patch
 import audithor as a
 
@@ -176,6 +178,99 @@ class Tests(unittest.TestCase):
         with patch.object(a, 'wait_for_capacity'), patch.object(a, 'analyze', side_effect=[result, KeyboardInterrupt()]), patch.object(a, 'show'), contextlib.redirect_stdout(io.StringIO()):
             rows = a.collect_ranked(0, ['a.com', 'b.com'], None, None, args)
         self.assertEqual([domain for domain, _ in rows], ['a.com'])
+
+    def test_start_is_required_before_sixth_domain(self):
+        events = []
+        def analyze(root, domain, *unused):
+            events.append(domain)
+            return dict(total=1, bytes=1, earliest=None, latest=None, read=1,
+                        notes=set(), counts=collections.Counter())
+        def command(prompt):
+            events.append('prompt')
+            return 'start' if events.count('prompt') == 1 else 'q'
+        args = type('Args', (), dict(gentle=True, sample=False, once=False, report=False, send=False))()
+        domains = [f'd{n}.com' for n in range(12)]
+        with patch.object(a, 'wait_for_capacity'), patch.object(a, 'analyze', side_effect=analyze), patch.object(a, 'show'), patch.object(a.sys.stdin, 'isatty', return_value=True), patch('builtins.input', side_effect=command), contextlib.redirect_stdout(io.StringIO()):
+            rows = a.collect_ranked(0, domains, None, None, args)
+        self.assertEqual(events[:7], domains[:5] + ['prompt', 'd5.com'])
+        self.assertEqual(len(rows), 10)
+        self.assertNotIn('d10.com', events)
+
+    def test_enter_alone_does_not_start_batch(self):
+        args = type('Args', (), dict(once=False, report=False, send=False))()
+        with patch.object(a.sys.stdin, 'isatty', return_value=True), patch('builtins.input', side_effect=['', 'start']) as prompt, contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(a.next_batch(args))
+            self.assertEqual(prompt.call_count, 2)
+
+    def test_once_and_report_modes(self):
+        self.assertFalse(a.next_batch(type('Args', (), {'once': True, 'send': True})()))
+        self.assertTrue(a.next_batch(type('Args', (), {'once': False, 'report': True})()))
+
+    def test_html_audit_escapes_log_content_and_finishes(self):
+        class Buffer(io.StringIO):
+            def close(self):
+                self.did_close = True
+        stream = Buffer()
+        args = type('Args', (), dict(day=dt.date(2026, 10, 18), timezone='Europe/Madrid', sample=False, bans=None))()
+        result = dict(total=10, bytes=100, read=100, counts=collections.Counter(bot=2), notes={'<script>bad</script>'},
+                      urls=collections.Counter({'/<img src=x onerror=alert(1)>': 10}))
+        with patch.object(a, 'create_report_file', return_value=(stream, '/private/report.html')):
+            audit = a.HtmlAudit(args, 1)
+            audit.append('example.com', result)
+            self.assertTrue(audit.finish([('example.com', result)]))
+        text = stream.getvalue()
+        self.assertNotIn('<script>', text)
+        self.assertNotIn('<img ', text)
+        self.assertIn('&lt;script&gt;', text)
+        self.assertTrue(text.endswith('</body></html>'))
+        self.assertLess(audit.written, a.HtmlAudit.MAX_BYTES)
+
+    def test_partial_report_is_not_sent(self):
+        audit = type('Audit', (), {'path': '/private/report.html', 'finish': lambda self, rows: False})()
+        args = type('Args', (), {'audit': audit, 'send': True})()
+        with patch.object(a, 'send_audit') as send, contextlib.redirect_stdout(io.StringIO()):
+            a.finish_audit(args, [])
+            send.assert_not_called()
+
+    def test_html_size_limit_marks_report_partial(self):
+        class Buffer(io.StringIO):
+            def close(self):
+                pass
+        stream = Buffer()
+        args = type('Args', (), dict(day=dt.date(2026, 10, 18), timezone='UTC', sample=False, bans=None))()
+        with patch.object(a, 'create_report_file', return_value=(stream, '/private/report.html')):
+            audit = a.HtmlAudit(args, 1)
+            self.assertFalse(audit.write('x' * a.HtmlAudit.MAX_BYTES))
+            self.assertFalse(audit.finish([]))
+        self.assertTrue(audit.truncated)
+        self.assertLessEqual(len(stream.getvalue().encode('utf-8')), a.HtmlAudit.MAX_BYTES)
+        self.assertIn('INFORME PARCIAL', stream.getvalue())
+
+    def test_mail_is_one_bounded_message_to_requested_address(self):
+        @contextlib.contextmanager
+        def opening(*args):
+            yield io.BytesIO(b'<!doctype html><html>Audit</html>')
+        with patch.object(a.os.path, 'isfile', return_value=True), patch.object(a.os, 'access', return_value=True), patch.object(a, 'directory', return_value=999), patch.object(a.os, 'close'), patch.object(a, 'regular', opening), patch.object(a.subprocess, 'run', return_value=type('Result', (), {'returncode': 0})()) as run, contextlib.redirect_stdout(io.StringIO()):
+            a.send_audit('/private/report.html', dt.date(2026, 10, 18))
+        self.assertEqual(run.call_args.args[0], ['/usr/sbin/sendmail', '-oi', '-t'])
+        self.assertEqual(run.call_args.kwargs['timeout'], 20)
+        message = BytesParser(policy=email_policy).parsebytes(run.call_args.kwargs['input'])
+        self.assertEqual(message['To'], 'notificacion@indexeomarketing.com')
+        attachments = list(message.iter_attachments())
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].get_content_type(), 'text/html')
+
+    @unittest.skipUnless(hasattr(os, 'O_NOFOLLOW'), 'Requiere Linux/openat')
+    def test_report_files_are_private_and_links_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stream, path = a.create_report_file(dt.date(2026, 10, 18), temp)
+            stream.close()
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(Path(temp) / 'reports').st_mode & 0o777, 0o700)
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / 'reports').symlink_to('/tmp', target_is_directory=True)
+            with self.assertRaises(OSError):
+                a.create_report_file(dt.date(2026, 10, 18), temp)
 
     def test_internal_errors_no_raw_secrets(self):
         event = a.error_event(b'2026/10/19 12:30:00 [error] PHP Fatal error: password=secret')

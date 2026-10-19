@@ -12,6 +12,11 @@ import stat
 import sys
 import time
 import zlib
+import html
+import secrets
+import subprocess
+from email.message import EmailMessage
+from email.policy import SMTP
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -26,7 +31,8 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 5
-VERSION = '0.6.0'
+VERSION = '0.7.0'
+MAIL_TO = 'notificacion@indexeomarketing.com'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -418,7 +424,12 @@ def signals(result):
     return findings
 
 
+def activity_level(peak):
+    return 'BAJA' if peak < 60 else 'MODERADA' if peak < 600 else 'ALTA' if peak < 3000 else 'MUY ALTA'
+
+
 def analyze(root, domain, day, zone, args):
+    detailed = bool(args.domain or getattr(args, 'report', False) or getattr(args, 'send', False))
     state = dict(inodes=set(), notes=set(), counts=collections.Counter(), urls=collections.Counter(),
                  bytes_urls=collections.Counter(), errors=collections.Counter(), statuses=collections.Counter(),
                  internal=collections.Counter(),
@@ -474,18 +485,18 @@ def analyze(root, domain, day, zone, args):
                             state['peak_minute'] = minute
                     if bans and ip in bans['ips']:
                         state['f2b_seen'].add(ip)
-                    if args.domain:
+                    if detailed:
                         increment(state['ip_counts'], ip, overflow='[otras IP: límite de memoria]')
                         if probe:
                             increment(state['sensitive_urls'], path)
-                    if args.domain:
+                    if detailed:
                         increment(state['urls'], path)
                         increment(state['bytes_urls'], path, size)
                         if status >= 400:
                             increment(state['errors'], str(status) + ' ' + path)
             except (OSError, EOFError, ValueError, zlib.error) as exc:
                 state['notes'].add('No se pudo completar ' + clean(name) + ': ' + clean(str(exc)))
-        if args.domain:
+        if detailed:
             errorfiles = [n for n in names(fd, 4096) if re.fullmatch(r'(?:proxy_error_log|error_log)(?:\.\d+)?(?:\.gz)?', n)]
             if len(errorfiles) > 128:
                 state['notes'].add('Demasiados logs internos; no se analizaron.')
@@ -560,7 +571,7 @@ def show(domain, day, result, detail=False):
     print('  Los porcentajes 4xx/5xx usan todas las peticiones leídas de esta fecha.')
     peak = result.get('peak', 0)
     if total:
-        level = 'BAJA' if peak < 60 else 'MODERADA' if peak < 600 else 'ALTA' if peak < 3000 else 'MUY ALTA'
+        level = activity_level(peak)
         print(f'\n  ACTIVIDAD {level}: pico observado de {peak:,}/min (~{peak/60:.1f}/s).')
         if result.get('peak_minute'):
             print('  Minuto del pico: ' + result['peak_minute'])
@@ -650,11 +661,209 @@ def show_review_page(rows, start=1):
     print(flush=True)
 
 
+def next_batch(args):
+    if getattr(args, 'once', False):
+        return False
+    if getattr(args, 'report', False) or getattr(args, 'send', False):
+        return True
+    if not sys.stdin.isatty():
+        print('Sin terminal interactiva: termino tras cinco dominios. Usa --report para auditar todos.')
+        return False
+    while True:
+        command = input('\nEscribe start para analizar los siguientes 5; q para terminar > ').strip().lower()
+        if command == 'start':
+            return True
+        if command in ('q', 'salir'):
+            return False
+        print('No he iniciado otra tanda. Escribe start o q.')
+
+
+def html_table(headers, rows):
+    escape = lambda value: html.escape(clean(value, 1000), quote=True)
+    return ('<table><thead><tr>' + ''.join('<th>' + escape(h) + '</th>' for h in headers) +
+            '</tr></thead><tbody>' + ''.join('<tr>' + ''.join('<td>' + escape(c) + '</td>' for c in row) +
+            '</tr>' for row in rows) + '</tbody></table>')
+
+
+def html_section(domain, result, args):
+    esc = lambda value: html.escape(clean(value, 1000), quote=True)
+    total = result['total']
+    pct = lambda value: f'{100*value/total:.1f}%' if total else 'N/D'
+    metrics = [
+        ('Peticiones observadas', total if result.get('read') else 'N/D'),
+        ('Contenido enviado según el log', f'{result["bytes"]/1048576:.2f} MiB'),
+        ('Bots / automatización probable', pct(result['counts']['bot'])),
+        ('Humano probable', pct(result['counts']['probable'])),
+        ('Desconocido', pct(result['counts']['unknown'])),
+        ('Respuestas 4xx', f'{result.get("http4", 0):,} ({pct(result.get("http4", 0))})'),
+        ('Respuestas 5xx', f'{result.get("http5", 0):,} ({pct(result.get("http5", 0))})'),
+        ('Rutas sensibles / con respuesta 4xx', f'{result.get("sensitive", 0)} / {result.get("sensitive4", 0)}'),
+        ('Pico de peticiones/minuto', result.get('peak', 0)),
+        ('Actividad orientativa por volumen del pico', activity_level(result.get('peak', 0)) if total else 'N/D'),
+        ('Minuto del pico', result.get('peak_minute') or 'N/D'),
+        ('IP coincidentes con eventos Ban del día', result.get('f2b_matches') if result.get('f2b_matches') is not None else 'N/D'),
+        ('Fuente de accesos', result.get('layer', 'N/D')),
+        ('Fechas encontradas en los logs', f'{result.get("earliest")} a {result.get("latest")}'),
+    ]
+    output = '<section><h2>' + esc(domain) + '</h2>' + html_table(('Métrica', 'Resultado'), metrics)
+    findings = signals(result)
+    output += '<h3>Indicadores para revisar</h3><ul>' + ''.join('<li>' + esc(f) + '</li>' for f in findings) + '</ul>'
+    if not findings:
+        output += '<p>Sin umbrales activados en los datos leídos; no descarta un ataque.</p>'
+    for title, key in [('URLs con más peticiones', 'urls'), ('URLs con más bytes de respuesta', 'bytes_urls'),
+                       ('Errores HTTP por ruta', 'errors'), ('Rutas sensibles consultadas', 'sensitive_urls'),
+                       ('IP con más peticiones', 'ip_counts'), ('Mensajes internos por categoría', 'internal'),
+                       ('Códigos HTTP', 'statuses')]:
+        values = result.get(key, collections.Counter())
+        output += '<h3>' + esc(title) + '</h3>'
+        output += html_table(('Ruta / IP / categoría', 'Valor'), values.most_common(20))
+    output += '<h3>Avisos de lectura</h3><ul>' + ''.join('<li>' + esc(note) + '</li>' for note in sorted(result['notes'])) + '</ul></section>'
+    return output
+
+
+def create_report_file(day, base=None):
+    base = base or os.path.dirname(os.path.abspath(__file__))
+    parent = directory(base)
+    try:
+        try:
+            os.mkdir('reports', 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+        folder = directory('reports', parent)
+    finally:
+        os.close(parent)
+    try:
+        info = os.fstat(folder)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError('reports debe pertenecer al usuario actual y tener permisos 700.')
+        name = f'audithor-{day}-{secrets.token_hex(6)}.html'
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
+    finally:
+        os.close(folder)
+    return os.fdopen(fd, 'w', encoding='utf-8', newline='\n'), os.path.join(base, 'reports', name)
+
+
+class HtmlAudit:
+    """Un único HTML por ejecución, escrito dominio a dominio y con tamaño acotado."""
+    MAX_BYTES = 2 * 1024 * 1024
+
+    def __init__(self, args, total):
+        self.args = args
+        self.total = total
+        self.written = 0
+        self.domains = 0
+        self.truncated = False
+        self.finished = False
+        self.stream, self.path = create_report_file(args.day)
+        self.write('''<!doctype html><html lang="es"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>Audithor · auditoría de tráfico</title>
+<style>body{font:16px/1.6 system-ui,sans-serif;max-width:1050px;margin:auto;padding:24px;background:#f1f5f9;color:#172033}section{background:white;padding:24px;margin:24px 0;border:1px solid #cbd5e1;border-radius:10px}table{width:100%;border-collapse:collapse;overflow-wrap:anywhere}th,td{text-align:left;padding:10px;border-bottom:1px solid #ddd}th{background:#e2e8f0}h1,h2,h3{line-height:1.3}small{color:#475569}</style><body>
+<h1>Audithor · auditoría de tráfico</h1><p>Creado por steev anderson.</p>''')
+        self.write('<p>Fecha analizada: ' + html.escape(str(args.day)) + ' · Zona: ' + html.escape(args.timezone) +
+                   f' · Dominios seleccionados: {total} · Versión: {VERSION}</p>')
+        self.write('<p>Informe de logs disponibles. Una petición puede ser una página, imagen, CSS o API; no equivale a una persona. '
+                   'Transferencia es el tamaño de respuestas registrado; 4xx son rechazos/no encontrados y 5xx errores del servidor. '
+                   'Los porcentajes usan las peticiones leídas de la fecha. Bots y humanos son estimaciones. '
+                   'Un pico no confirma un ataque. Actividad: baja &lt;60/min, moderada 60–599, alta 600–2999, muy alta &gt;=3000; no compara con el historial de cada web. RAM/CPU históricas por dominio no están disponibles. '
+                   'Rankings limitados a 2000 valores; se muestran los 20 primeros. Retención, rotación y formatos pueden limitar la cobertura.</p>')
+        if args.sample:
+            self.write('<p><strong>MODO MUESTRA: cada dominio puede contener solo parte de sus registros.</strong></p>')
+        bans = getattr(args, 'bans', None)
+        if bans:
+            figures = ('Eventos Ban observados: ' + str(bans['events']) + ' · IP únicas observadas: ' + str(len(bans['ips']))) if bans['day_seen'] else 'N/D: no se leyeron mensajes para esta fecha'
+            self.write('<h2>Fail2Ban · servidor</h2><p>' + figures +
+                       '. No indica bloqueos actualmente activos ni qué dominio los originó. '
+                       'Fechas locales de Fail2Ban sin offset; se presupone la zona elegida.</p>')
+            self.write(html_table(('Jail', 'Eventos observados'), bans['jails'].most_common(20)))
+            self.write('<ul>' + ''.join('<li>' + html.escape(clean(n, 500)) + '</li>' for n in sorted(bans['notes'])) + '</ul>')
+
+    def write(self, text, closing=False):
+        size = len(text.encode('utf-8'))
+        reserve = 0 if closing else 64 * 1024
+        if self.written + size > self.MAX_BYTES - reserve:
+            self.truncated = True
+            return False
+        self.stream.write(text)
+        self.stream.flush()
+        self.written += size
+        return True
+
+    def append(self, domain, result):
+        if self.write(html_section(domain, result, self.args)):
+            self.domains += 1
+
+    def finish(self, rows):
+        complete = len(rows) == self.total and self.domains == self.total and not self.truncated
+        status = 'Recorrido terminado' if complete else 'INFORME PARCIAL: recorrido interrumpido o límite de tamaño alcanzado'
+        footer = '<section><h2>Resumen final · ' + status + '</h2><p>' + str(len(rows)) + '/' + str(self.total) + ' dominios consultados.</p>'
+        footer += '<p>Orden orientativo de revisión: número de umbrales, rutas sensibles con 4xx, errores 5xx/4xx y tráfico. No mide ataques ni daños.</p>'
+        footer += html_table(('Dominio', 'Umbrales', '4xx', '5xx'), [
+            (domain, str(len(signals(result))) if result['total'] else 'Sin accesos de la fecha',
+             result.get('http4', 0), result.get('http5', 0)) for domain, result in sorted(rows, key=review_key)[:100]])
+        footer += '<p>Se muestran hasta 100 dominios en este resumen.</p></section></body></html>'
+        self.write(footer, closing=True)
+        self.stream.close()
+        self.finished = True
+        return complete and not self.truncated
+
+    def close(self):
+        if not self.finished:
+            self.write('<p>INFORME INTERRUMPIDO. No se ha completado la auditoría.</p></body></html>', closing=True)
+            self.stream.close()
+            self.finished = True
+
+
+def send_audit(path, day):
+    """Solo se llama con --send. No instala/configura el MTA ni usa una shell."""
+    mailer = '/usr/sbin/sendmail'
+    if not os.path.isfile(mailer) or not os.access(mailer, os.X_OK):
+        raise RuntimeError('No existe /usr/sbin/sendmail operativo. HTML guardado; no se ha instalado ni configurado correo.')
+    parent = directory(os.path.dirname(path))
+    try:
+        with regular(parent, os.path.basename(path)) as stream:
+            payload = stream.read(HtmlAudit.MAX_BYTES + 1)
+    finally:
+        os.close(parent)
+    if len(payload) > HtmlAudit.MAX_BYTES:
+        raise ValueError('El HTML supera el límite de 2 MiB para correo.')
+    message = EmailMessage(policy=SMTP)
+    message['From'] = MAIL_TO
+    message['To'] = MAIL_TO
+    message['Subject'] = f'Audithor · auditoría de tráfico · {day}'
+    message.set_content('Adjunto el informe HTML de los logs disponibles. Las señales son orientativas; revisa los avisos de cobertura.')
+    message.add_attachment(payload, maintype='text', subtype='html', filename=os.path.basename(path))
+    try:
+        result = subprocess.run([mailer, '-oi', '-t'], input=message.as_bytes(),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=20, check=False, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'})
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError('No se confirmó la aceptación del correo; no se reintentó. El HTML sigue guardado.') from exc
+    if result.returncode:
+        raise RuntimeError(f'El correo local devolvió código {result.returncode}. El HTML sigue guardado.')
+    print(f'Correo aceptado por el servicio local para {MAIL_TO}; esto no confirma su entrega final.', flush=True)
+
+
+def finish_audit(args, rows):
+    if not getattr(args, 'audit', None):
+        return
+    complete = args.audit.finish(rows)
+    print('\nHTML privado guardado en: ' + args.audit.path, flush=True)
+    if args.send:
+        if complete:
+            send_audit(args.audit.path, args.day)
+        else:
+            print('No envío correo: el informe quedó interrumpido o alcanzó el límite de tamaño.')
+
+
 def collect_ranked(root, domains, day, zone, args):
     rows = []
     print('\nMostraré cada dominio al terminar su lectura y un resumen ordenado al final.', flush=True)
     for number, domain in enumerate(domains, 1):
         try:
+            if number > 1 and (number - 1) % PAGE_SIZE == 0 and not next_batch(args):
+                break
             if getattr(args, 'sample', False):
                 reason = pressure(args.gentle)
                 if reason:
@@ -664,6 +873,8 @@ def collect_ranked(root, domains, day, zone, args):
                 wait_for_capacity(args.gentle)
             print(f'  [{number}/{len(domains)}] Leyendo {domain}…', flush=True)
             result = analyze(root, domain, day, zone, args)
+            if getattr(args, 'audit', None):
+                args.audit.append(domain, result)
             summary = compact_summary(result)
             rows.append((domain, summary))
             show(domain, day, summary)
@@ -697,13 +908,17 @@ def arguments(argv=None):
     parser.add_argument('--gzip', action='store_true', help='Incluir históricos comprimidos dentro del mismo presupuesto')
     parser.add_argument('--no-fail2ban', action='store_true', help='Omitir lectura del historial Fail2Ban')
     parser.add_argument('--fail2ban-log', default='/var/log/fail2ban.log', help='Archivo de historial Fail2Ban, sin modificarlo')
+    parser.add_argument('--report', action='store_true', help='Auditar todos y guardar un HTML detallado privado, sin correo')
+    parser.add_argument('--send', action='store_true', help='Auditar todos, guardar HTML y solicitar envío al correo configurado')
     parser.add_argument('--seconds', type=int, default=30, help='Segundos por tanda; límite total por dominio solo con --sample (1–1800)')
     parser.add_argument('--max-mib', type=int, default=64, help='MiB descomprimidos por tanda; límite total solo con --sample (1–1024)')
-    parser.add_argument('--once', action='store_true', help='Mostrar solo cinco filas del resumen final; los informes progresivos se mantienen')
+    parser.add_argument('--once', action='store_true', help='Analizar únicamente la primera tanda de cinco dominios')
     parser.add_argument('--diagnose', action='store_true', help='Mostrar carga, CPU lógicas y memoria; sin analizar dominios')
     parser.add_argument('--gentle', action='store_true', help='Modo lento: pausa 10 ms/línea, umbral de carga 1 por CPU lógica')
     parser.add_argument('--sample', action='store_true', help='Solo muestra acotada por dominio; sin esta opción continúa hasta acabar')
     args = parser.parse_args(argv)
+    if args.report or args.send:
+        args.gentle = True
     if args.domain and not DOMAIN.fullmatch(args.domain):
         parser.error('Dominio no válido. Usa su nombre ASCII exacto, sin URL ni rutas.')
     if not 1 <= args.seconds <= 1800 or not 1 <= args.max_mib <= 1024:
@@ -751,7 +966,13 @@ def main(argv=None):
     print('Audithor ' + VERSION)
     print(f'Fecha: {args.day} ({args.timezone}). Secuencial; memoria virtual máxima 128 MiB.')
     print(f'Tandas de {args.seconds}s/{args.max_mib} MiB. ' + ('MUESTRA limitada por dominio.' if args.sample else 'LECTURA CONTINUA: descansa y continúa hasta finalizar los archivos seleccionados.'))
-    print('Solo lectura. Sin instalaciones, cron, procesos externos, conexiones de red ni cambios de permisos.')
+    print('Logs en solo lectura. Sin instalaciones, cron ni cambios en Plesk, servicios o permisos de las webs.')
+    if args.report or args.send:
+        print('Modo auditoría: todos los dominios seleccionados, sin esperar start; HTML privado en reports/.')
+    if args.send:
+        print('Correo solicitado a ' + MAIL_TO + ' usando únicamente /usr/sbin/sendmail ya instalado.')
+        if not os.path.isfile('/usr/sbin/sendmail') or not os.access('/usr/sbin/sendmail', os.X_OK):
+            print('AVISO: no se detecta correo local operativo; el HTML se guardará, pero el envío no podrá realizarse.')
     print('Bots y humanos son estimaciones. Las señales no confirman ataques.')
     if args.historical:
         print('Fecha histórica: gzip incluido automáticamente; prioridad a logs rotados.')
@@ -764,28 +985,40 @@ def main(argv=None):
     else:
         wait_for_capacity(args.gentle)
     root = directory(args.root)
+    args.audit = None
     try:
         domains = [args.domain] if args.domain else discover(root)
         if not domains:
             print('No se encontraron dominios accesibles.')
             return 0
         args.bans = None
-        if args.domain:
+        if args.domain or args.report or args.send:
             print('\nLeyendo historial Fail2Ban…', flush=True)
             args.bans = read_fail2ban(args)
-            show_fail2ban(args.bans, args.day)
+            if args.domain:
+                show_fail2ban(args.bans, args.day)
+        if args.report or args.send:
+            args.audit = HtmlAudit(args, len(domains))
+            print('Creando informe privado: ' + args.audit.path, flush=True)
         if args.domain:
             print('\nLeyendo ' + args.domain + '…', flush=True)
-            show(args.domain, args.day, analyze(root, args.domain, args.day, args.zone, args), True)
+            result = analyze(root, args.domain, args.day, args.zone, args)
+            show(args.domain, args.day, result, True)
+            if args.audit:
+                args.audit.append(args.domain, result)
+                finish_audit(args, [(args.domain, compact_summary(result))])
             return 0
         rows = collect_ranked(root, domains, args.day, args.zone, args)
+        finish_audit(args, rows)
         for offset in range(0, len(rows), PAGE_SIZE):
             show_review_page(rows[offset:offset+PAGE_SIZE], offset+1)
-            if offset + PAGE_SIZE >= len(rows) or args.once or not sys.stdin.isatty():
+            if offset + PAGE_SIZE >= len(rows) or args.once or args.report or args.send or not sys.stdin.isatty():
                 break
             if input(f'\nEnter: siguientes {PAGE_SIZE} | q + Enter: salir > ').strip().lower() in ('q', 'salir'):
                 break
     finally:
+        if args.audit:
+            args.audit.close()
         os.close(root)
     return 0
 

@@ -46,11 +46,11 @@ Hoy, informes progresivos por dominio y resumen final de cinco filas por página
 /usr/bin/python3 -I -B /too-custom/audithor/audithor.py
 ```
 
-Lee los dominios secuencialmente y **muestra el informe de cada uno en cuanto acaba**, sin esperar al resto ni pedir Enter entre dominios. Conserva únicamente un resumen pequeño por dominio. Al terminar presenta una lista compacta **por prioridad de revisión**: primero los dominios con más umbrales activados (0–3); en empate, más accesos sensibles con respuesta 4xx, más respuestas 5xx, más 4xx, más peticiones y nombre. Son criterios orientativos, no una medida de ataques o daños. Los dominios sin accesos de la fecha aparecen al final sin valoración.
+Lee los dominios secuencialmente y **muestra el informe de cada uno en cuanto acaba**. Tras cinco dominios, espera a que escribas exactamente **`start`** y Enter para analizar los siguientes cinco; Enter solo no inicia otra tanda. `q` termina y muestra el resumen de lo analizado. Conserva únicamente un resumen pequeño por dominio. Al terminar presenta una lista compacta **por prioridad de revisión**: primero los dominios con más umbrales activados (0–3); en empate, más accesos sensibles con respuesta 4xx, más respuestas 5xx, más 4xx, más peticiones y nombre. Son criterios orientativos, no una medida de ataques o daños. Los dominios sin accesos de la fecha aparecen al final sin valoración.
 
-En el resumen final, Enter muestra los cinco siguientes sin releer logs; `q` seguido de Enter termina. Ctrl+C durante el recorrido interrumpe la lectura y muestra el resumen parcial de los dominios ya terminados; otra interrupción termina. Si conecta su salida a una tubería o se ejecuta sin terminal, los informes progresivos siguen saliendo y del resumen final solo se muestran las primeras cinco filas. Los dominios sin datos no se interpretan como tráfico cero. En modo continuo, si sube la carga espera y retoma el mismo punto sin abandonar los siguientes dominios. `--sample` mantiene la interrupción por presupuesto/carga y sus resultados parciales.
+En el resumen final, Enter muestra las siguientes cinco filas sin releer logs; `q` termina. Ctrl+C durante el recorrido muestra el resumen parcial de los dominios ya terminados; otra interrupción termina. Sin terminal interactiva, el modo normal analiza solo los primeros cinco dominios. `--once` también limita el análisis a la primera tanda. Los modos `--report` y `--send` recorren automáticamente todos los dominios, sin esperar `start`, y muestran las primeras cinco filas del resumen final para no bloquearse. Los dominios sin datos no se interpretan como tráfico cero. Si sube la carga, el modo continuo espera y retoma; `--sample` mantiene la interrupción por presupuesto/carga.
 
-El inventario se recorre inicialmente por modificación de logs; ese es el orden de los informes progresivos y no determina el orden del resumen final. La espera hasta el primer informe depende solo del primer dominio y de las pausas. El recorrido entero puede durar horas en una instalación grande, pero se ven resultados mientras avanza. No se mantienen tablas de URLs en memoria durante la vista global ni se consulta Fail2Ban en esta vista. No realiza una segunda lectura para preparar el resumen.
+El inventario se recorre inicialmente por modificación de logs; ese es el orden de los informes progresivos y no determina el orden del resumen final. La espera hasta el primer informe depende solo del primer dominio y de las pausas. El recorrido entero puede durar horas en una instalación grande, pero se ven resultados mientras avanza. En la vista normal no se mantienen tablas de URLs ni se consulta Fail2Ban. Al exportar se calculan los detalles de un dominio, se escriben en HTML y se descartan antes de pasar al siguiente. No realiza una segunda lectura para preparar el resumen.
 
 Ayer / fecha histórica / dominio concreto:
 
@@ -71,7 +71,39 @@ ionice -c 3 /usr/bin/python3 -I -B /too-custom/audithor/audithor.py ejemplo.com 
 
 **Modo `--sample`:** conserva el comportamiento anterior, limitado a una tanda por dominio y con avisos PARCIAL al agotarla. Para una prueba de dos segundos en total, indica un dominio concreto, `--sample --seconds 2 --max-mib 1 --no-fail2ban`. Sin `--sample`, poner `--seconds 2` solo hace las tandas más cortas y no acota el tiempo total.
 
-Ambos modos mantienen las pausas de 1 ms (10 ms con `--gentle`) por línea/fragmento. El estado solo vive durante esta ejecución: cerrar SSH, terminar el proceso o volver a ejecutar empieza de nuevo. No hay cachés ni reanudación entre procesos. `--once` limita a cinco filas el resumen final sin interacción; los informes progresivos de todos los dominios se mantienen. Acabar la lectura no demuestra que Plesk haya conservado todo el tráfico del día.
+Ambos modos mantienen las pausas de 1 ms (10 ms con `--gentle`) por línea/fragmento. El estado solo vive durante esta ejecución: cerrar SSH, terminar el proceso o volver a ejecutar empieza de nuevo. No hay cachés ni reanudación entre procesos. `--once` limita el análisis a los primeros cinco dominios. Acabar la lectura no demuestra que Plesk haya conservado todo el tráfico del día.
+
+## Auditoría HTML y envío de correo
+
+Crear un informe de todos los dominios de ayer, sin correo:
+
+```sh
+python3 -I -B audithor.py --yesterday --report
+```
+
+Crear el mismo informe y solicitar envío a **notificacion@indexeomarketing.com**:
+
+```sh
+python3 -I -B audithor.py --yesterday --send
+```
+
+Para auditar y enviar solo una web:
+
+```sh
+python3 -I -B audithor.py ejemplo.com --yesterday --send
+```
+
+Estos modos activan automáticamente `--gentle` y recorren los dominios uno a uno, sin pausas de teclado. Mantienen las esperas por carga y el límite de memoria virtual de 128 MiB. El trabajo principal sigue siendo leer los logs: generar HTML no requiere navegador, motor de PDF, paquetes ni fuentes externas. HTML no garantiza un tamaño menor que cualquier PDF, pero evita esas dependencias y el coste de renderizado. Es una auditoría del tráfico y errores de logs disponibles; no un escaneo activo de vulnerabilidades.
+
+Guarda **un único HTML por ejecución**, con un apartado por dominio y resumen final, en `reports/audithor-FECHA-ID.html` junto al script. Incluye métricas, clasificación, picos, códigos HTTP, veinte principales URLs/IP/rutas sensibles/errores, categorías de mensajes internos y coincidencias Fail2Ban cuando estén disponibles. Los rankings conservan los límites de cardinalidad ya documentados. Fail2Ban se lee una sola vez al exportar para compartir el conjunto de IP entre dominios; su presupuesto puede dejarlo parcial. Se escribe cada dominio conforme acaba, sin acumular todos los detalles en RAM. El informe completo puede requerir horas si hay muchos logs.
+
+El directorio `reports/` se crea solo al exportar, con permisos 700; cada HTML usa nombre aleatorio exclusivo y permisos 600. Rechaza enlaces y carpetas existentes que no sean privadas o del usuario actual; no cambia sus permisos automáticamente. Mantén la aplicación y `reports/` fuera de la raíz web. **Añade `reports/` a tu `.gitignore` existente**: los informes contienen IP y rutas privadas. No se borran automáticamente; elimina los informes antiguos que ya no necesites para controlar el espacio.
+
+Límite de HTML: **2 MiB** por ejecución. Si lo alcanza, se marca parcial y se conserva el archivo sin enviarlo. Un recorrido interrumpido también conserva un HTML parcial y no solicita envío. `--send --once` en un inventario de más de cinco dominios deja un informe parcial sin enviar; para probar el correo con poco trabajo, indica un único dominio. `--sample --send` permite un informe de muestra explícitamente marcado como tal si se visitan todos los dominios seleccionados; no lo presenta como tráfico completo.
+
+El envío usa exclusivamente **`/usr/sbin/sendmail -oi -t`**, si ya existe y está configurado. No instala un MTA, configura SMTP, modifica Plesk ni reinicia servicios. El remitente y destinatario son `notificacion@indexeomarketing.com`. Se envía **un solo correo con un adjunto HTML**, no un correo por dominio. La construcción MIME solo carga un archivo acotado de hasta 2 MiB; el proceso de envío tiene timeout de 20 segundos, hereda prioridad/límites del script y no usa shell. No reintenta automáticamente.
+
+Si falta el servicio o falla, el HTML permanece guardado y se indica el problema. Aceptación por el MTA no confirma entrega al buzón: filtros, configuración del servidor y políticas del dominio pueden impedirla. Para comprobar la disponibilidad sin enviar nada: `ls -l /usr/sbin/sendmail`. El script no solicita ni guarda contraseñas de correo. Fuentes: [interfaz sendmail de Postfix](https://manpages.debian.org/trixie/postfix/sendmail.1.en.html), [biblioteca email de Python](https://docs.python.org/3/library/email.message.html).
 
 ## Qué significa cada dato
 
@@ -106,7 +138,7 @@ Los rankings mantienen hasta 2000 rutas distintas y agrupan las posteriores en `
 
 ## Fail2Ban y señales de tráfico sospechoso
 
-**Solo al indicar un dominio**, lee `/var/log/fail2ban.log` y sus variantes `.N` / `.gz`, sin ejecutar `fail2ban-client`, abrir su socket, modificar jails o bloquear/desbloquear direcciones. En la vista global no lo lee ni muestra columnas de F2B. Usa `--fail2ban-log /ruta/al/archivo` si está en otra ubicación, o `--no-fail2ban` para omitirlo. Si el servicio envía solo a journald/syslog y no hay archivo compatible, muestra N/D; no cambia el destino del log ni consulta el journal automáticamente.
+**Al indicar un dominio o exportar con `--report`/`--send`**, lee `/var/log/fail2ban.log` y sus variantes `.N` / `.gz`, sin ejecutar `fail2ban-client`, abrir su socket, modificar jails o bloquear/desbloquear direcciones. En la vista global normal no lo lee ni muestra columnas de F2B. Usa `--fail2ban-log /ruta/al/archivo` si está en otra ubicación, o `--no-fail2ban` para omitirlo. Si el servicio envía solo a journald/syslog y no hay archivo compatible, muestra N/D; no cambia el destino del log ni consulta el journal automáticamente.
 
 El presupuesto de Fail2Ban sigue limitado al menor de `--seconds` y 30 segundos, y al menor de `--max-mib` y 16 MiB, incluso en modo continuo; puede aparecer PARCIAL sin detener el análisis de accesos. Conserva como máximo 20 000 IP únicas y 100 jails más un grupo de otras. Aplica las mismas pausas y límites de línea, y detiene su muestra por carga. Los contadores son eventos Ban e IP **observados**; cobertura incompleta, logs duplicados o retención pueden alterar los totales. No cuenta `Unban`, `Restore Ban` ni mensajes `Found`. No verifica que el firewall aplicase correctamente el bloqueo y no enumera bloqueos activos anteriores a la fecha.
 
@@ -124,9 +156,9 @@ No confirma ataques ni calcula una probabilidad. Un bot legítimo puede tener mu
 
 ## Límites operativos
 
-- Solo abre logs con lectura. No escribe cachés, bases de datos ni archivos de resultados. Para guardar una salida puedes redirigirla tú a un archivo privado.
+- Solo abre logs con lectura. El modo normal no escribe archivos. `--report`/`--send` escriben únicamente sus HTML privados en `reports/`; no crean cachés ni bases de datos.
 - No instala paquetes, crea cron, cambia Plesk/PHP, permisos, firewall, servicios ni bases de datos de las webs.
-- Sin subprocess, shell, peticiones HTTP ni análisis simultáneo de dominios. No ejecutes varias copias a la vez: esta versión no impide ejecuciones simultáneas independientes.
+- Sin peticiones HTTP ni análisis simultáneo de dominios. Solo `--send` ejecuta el comando fijo de correo ya instalado; no usa shell. No ejecutes varias copias a la vez: esta versión no impide ejecuciones simultáneas independientes.
 - Prioridad CPU nice 19 y límite de espacio de direcciones virtual de 128 MiB para el propio proceso. Este límite no equivale a una promesa de RAM RSS exacta. Un proceso puede terminar sin informe si agota memoria.
 - En modo continuo espera si la carga media de un minuto supera 1 por CPU lógica o quedan menos de 256 MiB de `MemAvailable`, y retoma al recuperarse. Comprueba cada 100 fragmentos. En `--sample`/Fail2Ban detiene su muestra y comprueba cada 250 fragmentos. Son guardas orientativas del host, no métricas por dominio ni garantías de impacto cero; pueden no reflejar límites de contenedores/cgroups.
 - Inventario limitado a 10 000 entradas y 15 segundos, 4096 entradas por directorio de logs, 128 archivos de acceso por dominio. Una carpeta enorme puede requerir consultar un dominio concreto.
@@ -147,6 +179,6 @@ cd /too-custom/audithor
 
 El test crea únicamente archivos temporales propios y los elimina al finalizar. No necesita leer los logs del servidor. Para una primera lectura real acotada, empieza con un solo dominio y `--sample --seconds 2 --max-mib 1 --no-fail2ban`.
 
-Esta revisión es **0.6.0**. Puedes comprobar que subiste el archivo nuevo con `python3 -I -B audithor.py --version`. Las pruebas incluyen continuidad exacta entre tandas en texto y gzip, espera/retoma por carga, informes mostrados antes de leer el siguiente dominio, resumen recuperado tras interrupción y prioridad por señales frente a volumen de tráfico.
+Esta revisión es **0.7.0**. Comprueba que subiste el archivo nuevo con `python3 -I -B audithor.py --version`. Las pruebas incluyen continuidad entre tandas, espera por carga, bloqueo antes del sexto dominio hasta escribir `start`, HTML escapado, informes parciales sin envío y un único mensaje MIME dirigido al destinatario solicitado. Las pruebas de correo usan un proceso simulado: no se ha enviado un correo real desde este entorno. La creación privada mediante descriptores y su prueba de enlaces requieren Linux y se omiten en Windows, junto con la prueba original de logs.
 
 Referencias de formatos y funciones: [logs de Plesk](https://support.plesk.com/hc/en-us/articles/12377744787991-Plesk-for-Linux-services-logs-and-configuration-files), [límites de recursos de Python](https://docs.python.org/3/library/resource.html), [lectura gzip](https://docs.python.org/3/library/gzip.html), [eventos de acciones de Fail2Ban](https://github.com/fail2ban/fail2ban/blob/master/fail2ban/server/actions.py).
