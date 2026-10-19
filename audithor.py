@@ -170,20 +170,32 @@ class Budget:
         time.sleep(.001)
 
 
+def host_status():
+    with open('/proc/meminfo', 'r', encoding='ascii') as stream:
+        info = stream.read(8192)
+    available = re.search(r'^MemAvailable:\s+(\d+) kB$', info, re.M)
+    if not available:
+        raise ValueError('MemAvailable no está disponible.')
+    return max(1, os.cpu_count() or 1), os.getloadavg(), int(available[1]) / 1024
+
+
+def pressure_reason(status):
+    cpus, loads, available = status
+    limit = cpus * .8
+    if loads[0] > limit:
+        return (f'Carga media 1 min: {loads[0]:.2f}; umbral: {limit:.2f} '
+                f'({cpus} CPU lógicas × 0,8). Análisis aplazado. Usa --diagnose para ver el estado.')
+    if available < 256:
+        return f'Memoria disponible: {available:.0f} MiB; mínimo: 256 MiB. Análisis aplazado.'
+    return None
+
+
 def pressure():
     """Guardas aproximadas del host; no son métricas por dominio."""
     try:
-        if os.getloadavg()[0] > max(1, os.cpu_count() or 1) * .8:
-            return 'Carga del host elevada; vuelve a intentarlo más tarde.'
-        with open('/proc/meminfo', 'r', encoding='ascii') as stream:
-            info = stream.read(8192)
-        available = re.search(r'^MemAvailable:\s+(\d+) kB$', info, re.M)
-        if available and int(available[1]) < 256 * 1024:
-            return 'Menos de 256 MiB disponibles en el host; análisis aplazado.'
-    except (OSError, AttributeError):
-        # En producción Linux debe estar disponible; no intentar trabajo a ciegas.
-        return 'No se pudo comprobar la presión del host; análisis aplazado.'
-    return None
+        return pressure_reason(host_status())
+    except (OSError, AttributeError, ValueError):
+        return 'No se pudo comprobar la presión del host; análisis aplazado. Usa --diagnose.'
 
 
 def scan(parent, name, budget, state):
@@ -368,6 +380,7 @@ def arguments(argv=None):
     parser.add_argument('--seconds', type=int, default=30, help='Tiempo máximo por dominio (1–1800, defecto 30)')
     parser.add_argument('--max-mib', type=int, default=64, help='Lectura máxima descomprimida por dominio (1–1024, defecto 64)')
     parser.add_argument('--once', action='store_true', help='Solo tres dominios, sin esperar Enter')
+    parser.add_argument('--diagnose', action='store_true', help='Mostrar carga, CPU lógicas y memoria; sin analizar dominios')
     args = parser.parse_args(argv)
     if args.domain and not DOMAIN.fullmatch(args.domain):
         parser.error('Dominio no válido. Usa su nombre ASCII exacto, sin URL ni rutas.')
@@ -388,6 +401,17 @@ def arguments(argv=None):
 
 def main(argv=None):
     args = arguments(argv)
+    if args.diagnose:
+        cpus, loads, available = status = host_status()
+        print(BANNER)
+        print(f'CPU lógicas detectadas: {cpus}')
+        print('Carga media 1/5/15 min: ' + ' / '.join(f'{load:.2f}' for load in loads))
+        print(f'Umbral conservador de Audithor: {cpus * .8:.2f} (0,8 por CPU lógica)')
+        print(f'MemAvailable: {available:.0f} MiB; mínimo: 256 MiB')
+        print('La carga media NO es un porcentaje de CPU; puede incluir espera de disco.')
+        print(pressure_reason(status) or 'Las guardas actuales permiten iniciar el análisis.')
+        print('Diagnóstico de solo lectura; no se han abierto logs de dominios.')
+        return 0
     # Cambia únicamente la prioridad y los límites de ESTE proceso.
     try:
         os.nice(19)

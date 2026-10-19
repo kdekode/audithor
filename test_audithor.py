@@ -79,6 +79,20 @@ class Tests(unittest.TestCase):
             self.assertEqual(budget.read, 0)
             self.assertEqual(budget.pressure, 'Host ocupado')
 
+    def test_pressure_reason_has_actual_values(self):
+        self.assertIn('7.00', a.pressure_reason((8, (7, 6, 5), 1024)))
+        self.assertIn('6.40', a.pressure_reason((8, (7, 6, 5), 1024)))
+        self.assertIn('128 MiB', a.pressure_reason((8, (1, 1, 1), 128)))
+        self.assertIsNone(a.pressure_reason((8, (1, 1, 1), 1024)))
+
+    def test_diagnose_works_even_if_load_is_high(self):
+        args = type('Args', (), {'diagnose': True})()
+        output = io.StringIO()
+        with patch.object(a, 'arguments', return_value=args), patch.object(a, 'host_status', return_value=(8, (7, 6, 5), 1024)), patch.object(a, 'directory') as directory, contextlib.redirect_stdout(output):
+            self.assertEqual(a.main([]), 0)
+            directory.assert_not_called()
+        self.assertIn('6.40', output.getvalue())
+
     def test_internal_errors_no_raw_secrets(self):
         event = a.error_event(b'2026/10/19 12:30:00 [error] PHP Fatal error: password=secret')
         self.assertEqual(event, (dt.date(2026, 10, 19), 'PHP fatal'))

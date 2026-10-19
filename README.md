@@ -22,6 +22,14 @@ ionice -c 3 /usr/bin/python3 -I -B /too-custom/audithor/audithor.py
 
 No modifica prioridades del servidor: cambia únicamente la prioridad del propio proceso. Sin `ionice`, sigue funcionando, pero no aplica prioridad de disco idle. Utiliza una cuenta con permisos de lectura ya existentes; no cambia permisos para conseguir acceso. Root permite leer los logs, pero no es necesario si la cuenta ya tiene acceso.
 
+Si se aplaza por carga, consulta el diagnóstico sin analizar logs:
+
+```sh
+/usr/bin/python3 -I -B /too-custom/audithor/audithor.py --diagnose
+```
+
+Muestra carga media de 1/5/15 minutos, CPU lógicas, umbral aplicado y memoria disponible. La carga media no es el porcentaje de CPU: también puede reflejar procesos en espera de disco. El umbral es conservador; un rechazo no demuestra por sí solo que la CPU esté saturada. No desactives las guardas sin revisar el estado real del servidor.
+
 ## Uso
 
 Hoy, tres dominios por tanda:
