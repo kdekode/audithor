@@ -1,0 +1,6 @@
+#!/bin/sh
+# Sin instalación: invocar por ruta absoluta o desde esta carpeta.
+case "$0" in
+  */*) exec /usr/bin/python3 -I -B "${0%/*}/audithor.py" "$@" ;;
+  *) printf '%s\n' 'Ejecuta Audithor mediante su ruta completa.' >&2; exit 1 ;;
+esac
