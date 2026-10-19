@@ -230,6 +230,15 @@ class Tests(unittest.TestCase):
         rows.sort(key=a.review_key)
         self.assertEqual([row[0] for row in rows], ['probes.com', 'errors.com', 'busy.com', 'empty.com'])
 
+    def test_console_final_order_is_descending_requests_with_original_values(self):
+        rows = [('errors.com', dict(total=100, bytes=1000, read=100, http4=90, http5=10)),
+                ('busy.com', dict(total=500, bytes=2000, read=100, http4=0, http5=0)),
+                ('empty.com', dict(total=0, bytes=0, read=100))]
+        originals = {domain: dict(result) for domain, result in rows}
+        rows.sort(key=a.traffic_key)
+        self.assertEqual([domain for domain, _ in rows], ['busy.com', 'errors.com', 'empty.com'])
+        self.assertEqual(dict(rows), originals)
+
     def test_domain_is_printed_before_next_domain_is_analyzed(self):
         events = []
         def analyze(root, domain, day, zone, args):

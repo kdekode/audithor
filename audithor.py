@@ -28,7 +28,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.8.4'
+VERSION = '0.8.5'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -907,6 +907,12 @@ def review_key(row):
             -result.get('http5', 0), -result.get('http4', 0), -result['total'], domain)
 
 
+def traffic_key(row):
+    domain, result = row
+    available = bool(result.get('read') and result['total'])
+    return (not available, -result['total'], -result['bytes'], domain)
+
+
 OVERVIEW_COLUMNS = (
     ('DOMINIO', 32), ('PETICIONES', 10), ('MiB', 9), ('BOTS %', 7),
     ('HUM. %', 7), ('DESC. %', 7), ('4xx (#)', 7), ('5xx (#)', 7),
@@ -1180,21 +1186,17 @@ def collect_ranked(root, domains, day, zone, args):
             overview_progress()
             print('\nLectura interrumpida: mostraré el resumen de los dominios ya terminados.', flush=True)
             break
-    rows.sort(key=review_key)
+    rows.sort(key=traffic_key)
     print('\n' + '=' * 80)
-    print(f' RESUMEN FINAL · PRIORIDAD DE REVISIÓN · {len(rows)}/{len(domains)} dominios')
+    print(f' TABLA FINAL · MÁS A MENOS PETICIONES LEÍDAS · {len(rows)}/{len(domains)} dominios')
     print('=' * 80)
-    print('Orden: más umbrales activados; después rutas sensibles con 4xx, 5xx y 4xx.')
-    print('El tráfico desempata. Sin accesos de la fecha: al final, sin valoración.')
-    print('No es una medición de ataques: incluye errores y accesos legítimos.')
-    print('Las lecturas parciales/avisos pueden alterar este orden.')
     if len(rows) < len(domains):
         print(f'{len(domains) - len(rows)} dominios pendientes; no están incluidos en el ranking.')
     return rows
 
 
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(description='Audithor — steev anderson. Informes progresivos y resumen final de revisión.')
+    parser = argparse.ArgumentParser(description='Audithor — steev anderson. Filas progresivas y tabla final por peticiones descendentes.')
     parser.add_argument('--version', action='version', version='Audithor ' + VERSION)
     parser.add_argument('domain', nargs='?', help='Dominio exacto para informe detallado')
     dates = parser.add_mutually_exclusive_group()
@@ -1312,7 +1314,9 @@ def main(argv=None):
         rows = collect_ranked(root, domains, args.day, args.zone, args)
         finish_audit(args, rows)
         for offset in range(0, len(rows), PAGE_SIZE):
-            show_review_page(rows[offset:offset+PAGE_SIZE], offset+1)
+            show_overview_header()
+            for domain, summary in rows[offset:offset+PAGE_SIZE]:
+                show_overview_row(domain, summary)
             if offset + PAGE_SIZE >= len(rows) or args.once or args.report or not sys.stdin.isatty():
                 break
             if input(f'\nEnter: siguientes {PAGE_SIZE} | q + Enter: salir > ').strip().lower() in ('q', 'salir'):

@@ -1,4 +1,4 @@
-# Audithor 0.8.4
+# Audithor 0.8.5
 
 Creado por **steev anderson**. Inspección local de logs Linux/Plesk, en consola y sin dependencias de Python externas. Requiere Python 3.9+ y zonas horarias del sistema. No usa idxo-security ni su instalador.
 
@@ -38,6 +38,8 @@ ESTADO usa REV:n para el número de umbrales activados, M para muestra, A para a
 Si aparece SIN FECHA, peticiones y MiB se muestran como N/D: no se deduce tráfico cero de una muestra sin datos del día. Que existan archivos `.1.gz` no demuestra que contengan ayer. Las rotaciones pueden no ser diarias y la muestra de un archivo puede empezar en otra fecha.
 
 Analiza **uno a uno**, imprimiendo cada fila al acabar. Solo si quedan dominios después del número **70**, espera **`start` + Enter** para los siguientes 70. Con 64 dominios muestra todos sin pedir `start`; no ejecuta 70 análisis simultáneos. Enter solo no inicia más trabajo; `q` termina y muestra el resumen de lo analizado. **No ordena antes de analizar**: el resumen final se prepara con los contadores acumulados, sin releer logs. El indicador temporal de lectura se escribe en stderr solo si es terminal, para mantener limpias las filas.
+
+Al finalizar repite **la misma tabla y columnas**, ordenada de mayor a menor número de peticiones leídas. Desempata por bytes y nombre; los dominios sin accesos de la fecha quedan al final. Conserva los valores originales sin recalcular ni releer archivos. Esta tabla sustituye al anterior resumen de revisión en consola; el informe por dominio sigue disponible. Las muestras no permiten afirmar que ese sea el orden del tráfico diario completo.
 
 ```sh
 python3 -I -B audithor.py                       # muestra de hoy
