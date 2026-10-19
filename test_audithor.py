@@ -251,7 +251,7 @@ class Tests(unittest.TestCase):
             rows = a.collect_ranked(0, ['a.com', 'b.com'], None, None, args)
         self.assertEqual([domain for domain, _ in rows], ['a.com'])
 
-    def test_start_is_required_before_sixth_domain(self):
+    def test_start_is_required_before_domain_71(self):
         events = []
         def analyze(root, domain, *unused):
             events.append(domain)
@@ -261,12 +261,25 @@ class Tests(unittest.TestCase):
             events.append('prompt')
             return 'start' if events.count('prompt') == 1 else 'q'
         args = type('Args', (), dict(gentle=True, sample=False, once=False, report=False, send=False))()
-        domains = [f'd{n}.com' for n in range(12)]
+        domains = [f'd{n}.com' for n in range(142)]
         with patch.object(a, 'wait_for_capacity'), patch.object(a, 'analyze', side_effect=analyze), patch.object(a, 'show_overview_row'), patch.object(a.sys.stdin, 'isatty', return_value=True), patch('builtins.input', side_effect=command), contextlib.redirect_stdout(io.StringIO()):
             rows = a.collect_ranked(0, domains, None, None, args)
-        self.assertEqual(events[:7], domains[:5] + ['prompt', 'd5.com'])
-        self.assertEqual(len(rows), 10)
-        self.assertNotIn('d10.com', events)
+        self.assertEqual(events[:72], domains[:70] + ['prompt', 'd70.com'])
+        self.assertEqual(len(rows), 140)
+        self.assertNotIn('d140.com', events)
+
+    def test_64_domains_run_sequentially_without_start_prompt(self):
+        result = dict(total=1, bytes=1, earliest=None, latest=None, read=1,
+                      notes=set(), counts=collections.Counter())
+        args = type('Args', (), dict(gentle=False, sample=True, once=False, report=False))()
+        domains = [f'd{n}.com' for n in range(64)]
+        with patch.object(a, 'pressure', return_value=None), patch.object(a, 'analyze', return_value=result) as analyze, patch.object(a, 'show_overview_row') as show, patch('builtins.input') as prompt, contextlib.redirect_stdout(io.StringIO()):
+            rows = a.collect_ranked(0, domains, None, None, args)
+        self.assertEqual(analyze.call_count, 64)
+        self.assertEqual(show.call_count, 64)
+        self.assertEqual(len(rows), 64)
+        prompt.assert_not_called()
+        self.assertEqual([call.args[1] for call in analyze.call_args_list], domains)
 
     def test_enter_alone_does_not_start_batch(self):
         args = type('Args', (), dict(once=False, report=False, send=False))()
@@ -381,7 +394,7 @@ class Tests(unittest.TestCase):
         self.assertNotIn('RAM diaria', text)
         self.assertNotIn('CPU diaria', text)
         self.assertLessEqual(max(map(len, text.splitlines())), 90)
-        self.assertEqual(a.PAGE_SIZE, 5)
+        self.assertEqual(a.PAGE_SIZE, 70)
 
     def test_overview_is_one_aligned_row_without_detail_card(self):
         result = dict(total=1920, bytes=50*1048576, read=1000, rapid=True,

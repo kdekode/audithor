@@ -1,4 +1,4 @@
-# Audithor 0.8.3
+# Audithor 0.8.4
 
 Creado por **steev anderson**. Inspección local de logs Linux/Plesk, en consola y sin dependencias de Python externas. Requiere Python 3.9+ y zonas horarias del sistema. No usa idxo-security ni su instalador.
 
@@ -37,16 +37,16 @@ ESTADO usa REV:n para el número de umbrales activados, M para muestra, A para a
 
 Si aparece SIN FECHA, peticiones y MiB se muestran como N/D: no se deduce tráfico cero de una muestra sin datos del día. Que existan archivos `.1.gz` no demuestra que contengan ayer. Las rotaciones pueden no ser diarias y la muestra de un archivo puede empezar en otra fecha.
 
-Al terminar cinco, espera **`start` + Enter** para los siguientes cinco. Enter solo no inicia más trabajo; `q` termina y muestra el resumen de lo analizado. **No ordena antes de analizar**: el resumen final se prepara con los contadores acumulados, sin releer logs. El indicador temporal de lectura se escribe en stderr solo si es terminal, para mantener limpias las filas.
+Analiza **uno a uno**, imprimiendo cada fila al acabar. Solo si quedan dominios después del número **70**, espera **`start` + Enter** para los siguientes 70. Con 64 dominios muestra todos sin pedir `start`; no ejecuta 70 análisis simultáneos. Enter solo no inicia más trabajo; `q` termina y muestra el resumen de lo analizado. **No ordena antes de analizar**: el resumen final se prepara con los contadores acumulados, sin releer logs. El indicador temporal de lectura se escribe en stderr solo si es terminal, para mantener limpias las filas.
 
 ```sh
 python3 -I -B audithor.py                       # muestra de hoy
 python3 -I -B audithor.py ejemplo.com --yesterday
 python3 -I -B audithor.py --date 2026-10-18
-python3 -I -B audithor.py --yesterday --once    # solo la primera tanda de cinco
+python3 -I -B audithor.py --yesterday --once    # como máximo los primeros 70
 ```
 
-`-I` aísla Python de variables/directorios de importación no deseados; `-B` evita crear bytecode. El lanzador permite `sh /ruta/audithor` y añade esas opciones. Sin terminal interactiva, solo se leen cinco dominios en modo normal. Ctrl+C durante el recorrido muestra el resumen parcial de los dominios terminados; otra interrupción termina el programa. Cerrar SSH o reiniciar el proceso pierde la posición: no hay caché ni reanudación entre ejecuciones.
+`-I` aísla Python de variables/directorios de importación no deseados; `-B` evita crear bytecode. El lanzador permite `sh /ruta/audithor` y añade esas opciones. Sin terminal interactiva, se leen como máximo 70 dominios en modo normal. Ctrl+C durante el recorrido muestra el resumen parcial de los dominios terminados; otra interrupción termina el programa. Cerrar SSH o reiniciar el proceso pierde la posición: no hay caché ni reanudación entre ejecuciones. El resumen final también pagina cada 70 filas. Los límites por dominio y la regulación de recursos no cambian.
 
 ## Ampliar solo lo necesario
 

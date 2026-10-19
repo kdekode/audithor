@@ -27,8 +27,8 @@ BANNER = r"""
 """
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
-PAGE_SIZE = 5
-VERSION = '0.8.3'
+PAGE_SIZE = 70
+VERSION = '0.8.4'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -988,10 +988,10 @@ def next_batch(args):
     if getattr(args, 'report', False):
         return True
     if not sys.stdin.isatty():
-        print('Sin terminal interactiva: termino tras cinco dominios. Usa --report para auditar todos.')
+        print(f'Sin terminal interactiva: termino tras {PAGE_SIZE} dominios. Usa --report para auditar todos.')
         return False
     while True:
-        command = input('\nEscribe start para analizar los siguientes 5; q para terminar > ').strip().lower()
+        command = input(f'\nEscribe start para analizar los siguientes {PAGE_SIZE}; q para terminar > ').strip().lower()
         if command == 'start':
             return True
         if command in ('q', 'salir'):
@@ -1208,7 +1208,7 @@ def arguments(argv=None):
     parser.add_argument('--report', action='store_true', help='Guardar HTML local de todos los dominios; usa --full para ampliar la lectura')
     parser.add_argument('--seconds', type=int, default=5, help='Segundos por dominio en vista rápida; por tanda con --full (1–1800)')
     parser.add_argument('--max-mib', type=int, default=8, help='MiB descomprimidos por dominio; por tanda con --full (1–1024)')
-    parser.add_argument('--once', action='store_true', help='Analizar únicamente la primera tanda de cinco dominios')
+    parser.add_argument('--once', action='store_true', help=f'Analizar únicamente la primera tanda de {PAGE_SIZE} dominios')
     parser.add_argument('--diagnose', action='store_true', help='Mostrar carga, CPU lógicas y memoria; sin analizar dominios')
     parser.add_argument('--inspect-logs', action='store_true', help='Con un dominio, mostrar archivos y fechas de extractos pequeños, sin tráfico privado')
     parser.add_argument('--gentle', action='store_true', help='Reduce los objetivos de CPU y lectura del propio proceso')
