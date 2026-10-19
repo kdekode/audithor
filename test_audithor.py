@@ -80,18 +80,27 @@ class Tests(unittest.TestCase):
             self.assertEqual(budget.pressure, 'Host ocupado')
 
     def test_pressure_reason_has_actual_values(self):
-        self.assertIn('7.00', a.pressure_reason((8, (7, 6, 5), 1024)))
-        self.assertIn('6.40', a.pressure_reason((8, (7, 6, 5), 1024)))
+        self.assertIn('8.50', a.pressure_reason((8, (8.5, 6, 5), 1024)))
+        self.assertIn('8.00', a.pressure_reason((8, (8.5, 6, 5), 1024)))
+        self.assertIsNone(a.pressure_reason((8, (6.94, 7, 7), 8762)))
         self.assertIn('128 MiB', a.pressure_reason((8, (1, 1, 1), 128)))
         self.assertIsNone(a.pressure_reason((8, (1, 1, 1), 1024)))
 
     def test_diagnose_works_even_if_load_is_high(self):
-        args = type('Args', (), {'diagnose': True})()
+        args = type('Args', (), {'diagnose': True, 'gentle': False})()
         output = io.StringIO()
-        with patch.object(a, 'arguments', return_value=args), patch.object(a, 'host_status', return_value=(8, (7, 6, 5), 1024)), patch.object(a, 'directory') as directory, contextlib.redirect_stdout(output):
+        with patch.object(a, 'arguments', return_value=args), patch.object(a, 'host_status', return_value=(8, (9, 6, 5), 1024)), patch.object(a, 'directory') as directory, contextlib.redirect_stdout(output):
             self.assertEqual(a.main([]), 0)
             directory.assert_not_called()
-        self.assertIn('6.40', output.getvalue())
+        self.assertIn('8.00', output.getvalue())
+
+    def test_gentle_slows_reads_and_keeps_guards(self):
+        self.assertIsNone(a.pressure_reason((8, (6.94, 7, 7), 8762), True))
+        self.assertIsNotNone(a.pressure_reason((8, (8.1, 7, 7), 8762), True))
+        self.assertIsNotNone(a.pressure_reason((8, (6.94, 7, 7), 128), True))
+        with patch.object(a.time, 'sleep') as sleep:
+            a.Budget(2, 1, gentle=True).tick(100)
+            sleep.assert_called_once_with(.01)
 
     def test_internal_errors_no_raw_secrets(self):
         event = a.error_event(b'2026/10/19 12:30:00 [error] PHP Fatal error: password=secret')

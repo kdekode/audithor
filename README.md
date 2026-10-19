@@ -30,6 +30,14 @@ Si se aplaza por carga, consulta el diagnóstico sin analizar logs:
 
 Muestra carga media de 1/5/15 minutos, CPU lógicas, umbral aplicado y memoria disponible. La carga media no es el porcentaje de CPU: también puede reflejar procesos en espera de disco. El umbral es conservador; un rechazo no demuestra por sí solo que la CPU esté saturada. No desactives las guardas sin revisar el estado real del servidor.
 
+El umbral de carga es de 1 por CPU lógica en ambos modos (8 en un host de 8 CPU). `--gentle` permite una lectura más lenta: aplica 10 ms de pausa por línea/fragmento, aproximadamente un máximo de 100 líneas/s. Por encima del umbral aplaza la lectura; conserva el mínimo de memoria disponible de 256 MiB y los presupuestos. No garantiza que el servidor tenga capacidad libre: la carga media es una señal aproximada, no una medición de CPU o latencia de disco. Prueba primero solo un dominio:
+
+```sh
+/usr/bin/python3 -I -B /too-custom/audithor/audithor.py ejemplo.com --gentle --seconds 2 --max-mib 1
+```
+
+El diagnóstico también acepta `--gentle`. Sin esta opción se aplica una pausa de 1 ms y el mismo umbral de 1 por CPU lógica. Las guardas durante lectura se comprueban cada 250 fragmentos, por lo que en modo lento la detección puede tardar unos 2,5 segundos más la lectura y el procesamiento.
+
 ## Uso
 
 Hoy, tres dominios por tanda:
@@ -88,7 +96,7 @@ Los rankings mantienen hasta 2000 rutas distintas y agrupan las posteriores en `
 - No instala paquetes, crea cron, cambia Plesk/PHP, permisos, firewall, servicios ni bases de datos de las webs.
 - Sin subprocess, shell, peticiones HTTP ni análisis simultáneo de dominios. No ejecutes varias copias a la vez: esta versión no impide ejecuciones simultáneas independientes.
 - Prioridad CPU nice 19 y límite de espacio de direcciones virtual de 128 MiB para el propio proceso. Este límite no equivale a una promesa de RAM RSS exacta. Un proceso puede terminar sin informe si agota memoria.
-- Cancela antes de leer si la carga media de un minuto supera 0,8 por CPU lógica o quedan menos de 256 MiB de `MemAvailable`. Lo comprueba también cada 250 fragmentos de línea. Son guardas orientativas del host, no métricas por dominio ni garantías de impacto cero; pueden no reflejar límites de contenedores/cgroups.
+- Cancela antes de leer si la carga media de un minuto supera 1 por CPU lógica o quedan menos de 256 MiB de `MemAvailable`. Lo comprueba también cada 250 fragmentos de línea. Son guardas orientativas del host, no métricas por dominio ni garantías de impacto cero; pueden no reflejar límites de contenedores/cgroups.
 - Inventario limitado a 10 000 entradas y 15 segundos, 4096 entradas por directorio de logs, 128 archivos de acceso por dominio. Una carpeta enorme puede requerir consultar un dominio concreto.
 - No sigue enlaces simbólicos en la ruta ni en archivos de logs; usa descriptores y `O_NOFOLLOW`. Rechaza dispositivos y FIFOs. Un dominio con logs enlazados puede necesitar un diseño de acceso distinto, no cambiar permisos automáticamente.
 - Líneas de hasta 16 KiB; descarta fragmentos excesivos/incompletos y avisa. El tiempo es un límite cooperativo entre lecturas: un disco bloqueado puede tardar más en responder.

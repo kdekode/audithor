@@ -22,6 +22,7 @@ BANNER = r"""+    _   _   _ ____ ___ _____ _   _  ___  ____
                     steev anderson
 """
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+LOAD_PER_CPU = 1.0
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -149,16 +150,17 @@ def discover(root):
 
 
 class Budget:
-    def __init__(self, seconds, mib):
+    def __init__(self, seconds, mib, gentle=False):
         self.end = time.monotonic() + seconds
         self.maximum = mib * 1024 * 1024
         self.read = 0
         self.steps = 0
         self.pressure = None
+        self.gentle = gentle
 
     def exhausted(self):
         if self.steps % 250 == 0:
-            self.pressure = pressure()
+            self.pressure = pressure(self.gentle)
         if self.pressure:
             return True
         return self.read >= self.maximum or time.monotonic() >= self.end
@@ -166,8 +168,8 @@ class Budget:
     def tick(self, size):
         self.read += size
         self.steps += 1
-        # Aproximadamente <= 1000 líneas/s; nada de procesos paralelos.
-        time.sleep(.001)
+        # Pausa también en fragmentos descartados o descomprimidos.
+        time.sleep(.01 if self.gentle else .001)
 
 
 def host_status():
@@ -179,21 +181,22 @@ def host_status():
     return max(1, os.cpu_count() or 1), os.getloadavg(), int(available[1]) / 1024
 
 
-def pressure_reason(status):
+def pressure_reason(status, gentle=False):
     cpus, loads, available = status
-    limit = cpus * .8
+    factor = LOAD_PER_CPU
+    limit = cpus * factor
     if loads[0] > limit:
         return (f'Carga media 1 min: {loads[0]:.2f}; umbral: {limit:.2f} '
-                f'({cpus} CPU lógicas × 0,8). Análisis aplazado. Usa --diagnose para ver el estado.')
+                f'({cpus} CPU lógicas × {factor:g}). Análisis aplazado. Usa --diagnose para ver el estado.')
     if available < 256:
         return f'Memoria disponible: {available:.0f} MiB; mínimo: 256 MiB. Análisis aplazado.'
     return None
 
 
-def pressure():
+def pressure(gentle=False):
     """Guardas aproximadas del host; no son métricas por dominio."""
     try:
-        return pressure_reason(host_status())
+        return pressure_reason(host_status(), gentle)
     except (OSError, AttributeError, ValueError):
         return 'No se pudo comprobar la presión del host; análisis aplazado. Usa --diagnose.'
 
@@ -272,7 +275,7 @@ def analyze(root, domain, day, zone, args):
                  bytes_urls=collections.Counter(), errors=collections.Counter(), statuses=collections.Counter(),
                  internal=collections.Counter(),
                  total=0, bytes=0, invalid=0, earliest=None, latest=None)
-    budget = Budget(args.seconds, args.max_mib)
+    budget = Budget(args.seconds, args.max_mib, args.gentle)
     try:
         fd = directory(domain + '/logs', root)
     except OSError as exc:
@@ -381,6 +384,7 @@ def arguments(argv=None):
     parser.add_argument('--max-mib', type=int, default=64, help='Lectura máxima descomprimida por dominio (1–1024, defecto 64)')
     parser.add_argument('--once', action='store_true', help='Solo tres dominios, sin esperar Enter')
     parser.add_argument('--diagnose', action='store_true', help='Mostrar carga, CPU lógicas y memoria; sin analizar dominios')
+    parser.add_argument('--gentle', action='store_true', help='Modo lento: pausa 10 ms/línea, umbral de carga 1 por CPU lógica')
     args = parser.parse_args(argv)
     if args.domain and not DOMAIN.fullmatch(args.domain):
         parser.error('Dominio no válido. Usa su nombre ASCII exacto, sin URL ni rutas.')
@@ -406,10 +410,11 @@ def main(argv=None):
         print(BANNER)
         print(f'CPU lógicas detectadas: {cpus}')
         print('Carga media 1/5/15 min: ' + ' / '.join(f'{load:.2f}' for load in loads))
-        print(f'Umbral conservador de Audithor: {cpus * .8:.2f} (0,8 por CPU lógica)')
+        factor = LOAD_PER_CPU
+        print(f'Umbral de Audithor: {cpus * factor:.2f} ({factor:g} por CPU lógica)')
         print(f'MemAvailable: {available:.0f} MiB; mínimo: 256 MiB')
         print('La carga media NO es un porcentaje de CPU; puede incluir espera de disco.')
-        print(pressure_reason(status) or 'Las guardas actuales permiten iniciar el análisis.')
+        print(pressure_reason(status, args.gentle) or 'Las guardas actuales permiten iniciar el análisis.')
         print('Diagnóstico de solo lectura; no se han abierto logs de dominios.')
         return 0
     # Cambia únicamente la prioridad y los límites de ESTE proceso.
@@ -425,7 +430,9 @@ def main(argv=None):
     print(f'Fecha: {args.day} ({args.timezone}). Secuencial; {args.seconds}s/{args.max_mib} MiB por dominio; memoria virtual máxima 128 MiB.')
     print('Solo lectura. Sin instalaciones, cron, procesos externos, conexiones de red ni cambios de permisos.')
     print('Bots y humanos son estimaciones; no hay registros históricos de CPU/RAM ni atribución de bloqueos.')
-    reason = pressure()
+    if args.gentle:
+        print('Modo lento: pausa de 10 ms por línea/fragmento (aprox. máximo 100/s); umbral 1 por CPU lógica.')
+    reason = pressure(args.gentle)
     if reason:
         raise RuntimeError(reason)
     root = directory(args.root)
