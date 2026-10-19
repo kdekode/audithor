@@ -47,6 +47,29 @@ class Tests(unittest.TestCase):
             self.assertEqual(skipped, 1)
             self.assertEqual(layer, 'nginx')
 
+    def test_plesk_apache_archives_selected_for_yesterday(self):
+        entries = ['proxy_access_log', 'proxy_access_ssl_log',
+                   'access_log', 'access_ssl_log', 'access_log.processed',
+                   'access_log.processed.1.gz', 'access_ssl_log.processed.1.gz',
+                   'access_log.processed.10.gz', 'proxy_access_log.statbuf']
+        with patch.object(a, 'names', return_value=entries):
+            today, _, layer = a.sources(0, True)
+            self.assertEqual(layer, 'nginx')
+            self.assertEqual(set(today), {'proxy_access_log', 'proxy_access_ssl_log'})
+            yesterday, skipped, layer = a.sources(0, True, historical=True)
+            self.assertEqual(layer, 'apache')
+            self.assertIn('access_ssl_log.processed.1.gz', yesterday)
+            self.assertNotIn('proxy_access_log', yesterday)
+            self.assertEqual(skipped, 0)
+
+    def test_rotation_one_before_ten_and_processed(self):
+        names = ['access_log.processed.10.gz', 'access_log.processed', 'access_log',
+                 'access_log.processed.2.gz', 'access_log.processed.1.gz']
+        with patch.object(a.os, 'stat', return_value=type('Stat', (), {'st_mtime': 1})()):
+            self.assertEqual(a.historical_order(names, 0, True),
+                             ['access_log.processed.1.gz', 'access_log.processed.2.gz',
+                              'access_log.processed.10.gz', 'access_log.processed', 'access_log'])
+
     def test_stream_budget_gzip_hardlinks_and_partial(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'test'
@@ -180,7 +203,9 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / 'proxy_access_log').write_bytes(line())
-            (root / 'proxy_access_log.processed.1.gz').write_bytes(gzip.compress(
+            # Reproducir Plesk: nginx solo hoy, Apache contiene los históricos.
+            (root / 'access_log.processed').write_bytes(line())
+            (root / 'access_log.processed.1.gz').write_bytes(gzip.compress(
                 line('/.env', ua='curl/8', stamp='18/Oct/2026:12:00:00 +0000', status=404) * 30))
             (root / 'error_log').write_bytes(b'2026/10/18 12:00:00 [error] PHP Fatal error: secret\n')
             (root / 'fail2ban.log').write_bytes(b'2026-10-18 12:00:00,123 fail2ban.actions [1]: NOTICE [apache] Ban 192.0.2.1\n')
@@ -200,6 +225,7 @@ class Tests(unittest.TestCase):
                 result = a.analyze(0, 'example.com', args.day, dt.timezone.utc, args)
             self.assertEqual(args.bans['events'], 1)
             self.assertEqual(result['total'], 30)
+            self.assertEqual(result['layer'], 'apache')
             self.assertEqual(result['http4'], 30)
             self.assertEqual(result['sensitive'], 30)
             self.assertEqual(result['peak'], 30)

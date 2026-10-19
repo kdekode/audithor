@@ -119,18 +119,25 @@ def names(fd, maximum):
     return out
 
 
-def sources(fd, compressed):
+def sources(fd, compressed, historical=False):
     entries = names(fd, 4096)
     def matching(prefix):
         return [n for n in entries if any(re.fullmatch(re.escape(p) + r'(?:\.processed)?(?:\.\d+)?(?:\.gz)?', n) for p in prefix)]
     # Solo una capa; sumar nginx y Apache duplicaría peticiones.
     proxy = matching(('proxy_access_log', 'proxy_access_ssl_log'))
-    selected = proxy or matching(('access_log', 'access_ssl_log'))
+    apache = matching(('access_log', 'access_ssl_log'))
+    # Plesk puede conservar solo Apache rotado y mantener nginx únicamente activo.
+    # Para fechas pasadas, preferir la capa con históricos, sin sumar las dos.
+    def retention(files):
+        return (any(re.search(r'\.\d+(?:\.gz)?$', n) for n in files),
+                any('.processed' in n or n.endswith('.gz') for n in files))
+    use_apache = bool(apache) and (not proxy or (historical and retention(apache) > retention(proxy)))
+    selected = apache if use_apache else proxy
     if len(selected) > 128:
         raise RuntimeError('Más de 128 logs por dominio; selecciona/revisa los históricos fuera de Audithor.')
     skipped = sum(n.endswith('.gz') for n in selected) if not compressed else 0
     selected = [n for n in selected if compressed or not n.endswith('.gz')]
-    return sorted(selected), skipped, 'nginx' if proxy else 'apache'
+    return sorted(selected), skipped, 'apache' if use_apache else 'nginx'
 
 
 def discover(root):
@@ -289,9 +296,13 @@ def parse_ban(line):
 def historical_order(files, fd, historical):
     # No filtrar por mtime: solo priorizar; no equivale a la fecha del contenido.
     def key(name):
-        rotated = bool(re.search(r'\.processed|\.\d+(?:\.gz)?$|\.gz$', name))
+        rotation = re.search(r'\.(\d+)(?:\.gz)?$', name)
         mtime = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mtime
-        return (not rotated if historical else False, -mtime)
+        if historical:
+            # .1 antes que .2/.10 y antes del .processed que puede contener solo hoy.
+            group = 0 if rotation else 1 if '.processed' in name or name.endswith('.gz') else 2
+            return (group, int(rotation[1]) if rotation else 0, -mtime)
+        return (0, 0, -mtime)
     return sorted(files, key=key)
 
 
@@ -393,7 +404,7 @@ def analyze(root, domain, day, zone, args):
         state['notes'].add('No se puede abrir logs: ' + clean(exc.strerror))
         return state
     try:
-        files, skipped, layer = sources(fd, args.gzip)
+        files, skipped, layer = sources(fd, args.gzip, args.historical)
         state['layer'] = layer
         if skipped:
             state['notes'].add(f'{skipped} archivos gzip omitidos; usa --gzip para incluirlos.')
@@ -494,6 +505,8 @@ def show(domain, day, result, detail=False):
     print('\n' + '=' * 80)
     print(' ' + domain)
     print(f' Fecha: {day}   |   Datos observados, cobertura del día no garantizada')
+    if result.get('layer'):
+        print(' Fuente de accesos: ' + result['layer'].upper() + ' (una sola capa)')
     print('=' * 80 + '\n')
     table(('TRÁFICO', 'VALOR', 'SEÑALES', 'VALOR'), [
         ('Peticiones', f'{total:,}' if known else 'N/D', 'HTTP 4xx', count_pct(result.get('http4', 0))),
@@ -544,6 +557,7 @@ def compact_summary(result):
     """Retener solo cifras por dominio; nunca tablas de rutas o referencias al estado."""
     summary = {key: result[key] for key in ('total', 'bytes', 'earliest', 'latest')}
     summary['read'] = result.get('read', 0)
+    summary['layer'] = result.get('layer')
     for key in ('http4', 'http5', 'sensitive', 'peak'):
         summary[key] = result.get(key, 0)
     summary['f2b_matches'] = result.get('f2b_matches')
