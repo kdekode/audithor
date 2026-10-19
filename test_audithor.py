@@ -7,8 +7,6 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from email.parser import BytesParser
-from email.policy import default as email_policy
 from unittest.mock import patch
 import audithor as a
 
@@ -72,6 +70,77 @@ class Tests(unittest.TestCase):
                              ['access_log.processed.1.gz', 'access_log.processed.2.gz',
                               'access_log.processed.10.gz', 'access_log.processed', 'access_log'])
 
+    def test_quick_selection_limits_rotations_but_keeps_http_https(self):
+        files = ['access_log.processed.1.gz', 'access_ssl_log.processed.1.gz',
+                 'access_log.processed.2.gz', 'access_ssl_log.processed.2.gz',
+                 'access_log.processed.10.gz', 'access_log', 'access_ssl_log']
+        self.assertEqual(a.quick_files(files, True, 1), files[:2])
+        self.assertEqual(a.quick_files(files, True, 2), files[2:4])
+        self.assertEqual(a.quick_files(files, False), ['access_log', 'access_ssl_log'])
+
+    def test_fast_mode_reduces_rate_instead_of_waiting_for_load(self):
+        self.assertIsNone(a.pressure_reason((8, (12, 12, 12), 8000), rapid=True))
+        self.assertIsNotNone(a.pressure_reason((8, (12, 12, 12), 128), rapid=True))
+
+    def test_throttle_does_not_sleep_for_every_line(self):
+        budget = a.Budget(5, 8, rapid=True)
+        with patch.object(a.time, 'sleep') as sleep:
+            for _ in range(127):
+                budget.tick(100)
+            sleep.assert_not_called()
+
+    def test_send_option_has_been_removed(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            a.arguments(['--send'])
+
+    def test_default_is_fast_and_full_is_explicit(self):
+        with patch.object(a, 'ZoneInfo', return_value=dt.timezone.utc):
+            fast = a.arguments(['--yesterday', '--timezone', 'UTC'])
+            full = a.arguments(['--full', '--timezone', 'UTC'])
+            self.assertTrue(fast.sample)
+            self.assertEqual((fast.seconds, fast.max_mib), (5, 8))
+            self.assertFalse(full.sample)
+        self.assertFalse(hasattr(a, 'send_audit'))
+
+    def test_fast_tail_reads_recent_lines_within_byte_budget(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'log'
+            old = line('/old') * 100
+            recent = line('/recent') * 10
+            path.write_bytes(old + recent)
+            @contextlib.contextmanager
+            def opening(*args):
+                with path.open('rb') as stream:
+                    yield stream
+            budget = a.Budget(5, 1, rapid=True)
+            budget.maximum = len(recent)
+            budget.tail = True
+            state = {'inodes': set(), 'notes': set()}
+            with patch.object(a, 'regular', opening), patch.object(a, 'pressure', return_value=None):
+                rows = list(a.scan(0, 'log', budget, state))
+            self.assertTrue(rows)
+            self.assertTrue(all(b'/recent ' in row for row in rows))
+            self.assertLessEqual(budget.read, len(recent))
+
+    def test_fast_domain_shares_quota_between_http_and_https(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, route in [('access_log.processed.1.gz', '/http'), ('access_ssl_log.processed.1.gz', '/https')]:
+                (root / name).write_bytes(gzip.compress(line(route, stamp='18/Oct/2026:12:00:00 +0000') * 100))
+            original_stat = os.stat
+            @contextlib.contextmanager
+            def opening(parent, name):
+                with (root / name).open('rb') as stream:
+                    yield stream
+            args = type('Args', (), dict(domain='example.com', seconds=5, max_mib=.002,
+                gentle=False, sample=True, historical=True, gzip=True, bans=None, day_offset=1))()
+            with patch.object(a, 'directory', return_value=999), patch.object(a, 'regular', opening), patch.object(a, 'names', return_value=[p.name for p in root.iterdir()]), patch.object(a.os, 'stat', side_effect=lambda path, **kwargs: original_stat(root / path)), patch.object(a.os, 'close'), patch.object(a, 'pressure', return_value=None), patch.object(a.time, 'sleep'):
+                result = a.analyze(0, 'example.com', dt.date(2026, 10, 18), dt.timezone.utc, args)
+            self.assertGreater(result['urls']['/http'], 0)
+            self.assertGreater(result['urls']['/https'], 0)
+            self.assertLess(result['total'], 200)
+            self.assertLessEqual(result['read'], int(.002 * 1024 * 1024))
+
     def test_stream_budget_gzip_hardlinks_and_partial(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'test'
@@ -123,9 +192,12 @@ class Tests(unittest.TestCase):
         self.assertIsNone(a.pressure_reason((8, (6.94, 7, 7), 8762), True))
         self.assertIsNotNone(a.pressure_reason((8, (8.1, 7, 7), 8762), True))
         self.assertIsNotNone(a.pressure_reason((8, (6.94, 7, 7), 128), True))
-        with patch.object(a.time, 'sleep') as sleep:
-            a.Budget(2, 1, gentle=True).tick(100)
-            sleep.assert_called_once_with(.01)
+        with patch.object(a.time, 'sleep') as sleep, patch.object(a.time, 'process_time', side_effect=[0, .01, .01]):
+            budget = a.Budget(2, 1, gentle=True)
+            budget.steps = 127
+            budget.tick(100)
+            self.assertTrue(sleep.called)
+            self.assertLessEqual(sleep.call_args.args[0], .25)
 
     def test_global_ranking_includes_later_domains_and_discards_routes(self):
         domains = ['a.com', 'b.com', 'c.com', 'd.com', 'unread.com']
@@ -225,12 +297,13 @@ class Tests(unittest.TestCase):
         self.assertTrue(text.endswith('</body></html>'))
         self.assertLess(audit.written, a.HtmlAudit.MAX_BYTES)
 
-    def test_partial_report_is_not_sent(self):
+    def test_partial_report_has_local_status(self):
         audit = type('Audit', (), {'path': '/private/report.html', 'finish': lambda self, rows: False})()
         args = type('Args', (), {'audit': audit, 'send': True})()
-        with patch.object(a, 'send_audit') as send, contextlib.redirect_stdout(io.StringIO()):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
             a.finish_audit(args, [])
-            send.assert_not_called()
+        self.assertIn('/private/report.html', output.getvalue())
 
     def test_html_size_limit_marks_report_partial(self):
         class Buffer(io.StringIO):
@@ -245,20 +318,6 @@ class Tests(unittest.TestCase):
         self.assertTrue(audit.truncated)
         self.assertLessEqual(len(stream.getvalue().encode('utf-8')), a.HtmlAudit.MAX_BYTES)
         self.assertIn('INFORME PARCIAL', stream.getvalue())
-
-    def test_mail_is_one_bounded_message_to_requested_address(self):
-        @contextlib.contextmanager
-        def opening(*args):
-            yield io.BytesIO(b'<!doctype html><html>Audit</html>')
-        with patch.object(a.os.path, 'isfile', return_value=True), patch.object(a.os, 'access', return_value=True), patch.object(a, 'directory', return_value=999), patch.object(a.os, 'close'), patch.object(a, 'regular', opening), patch.object(a.subprocess, 'run', return_value=type('Result', (), {'returncode': 0})()) as run, contextlib.redirect_stdout(io.StringIO()):
-            a.send_audit('/private/report.html', dt.date(2026, 10, 18))
-        self.assertEqual(run.call_args.args[0], ['/usr/sbin/sendmail', '-oi', '-t'])
-        self.assertEqual(run.call_args.kwargs['timeout'], 20)
-        message = BytesParser(policy=email_policy).parsebytes(run.call_args.kwargs['input'])
-        self.assertEqual(message['To'], 'notificacion@indexeomarketing.com')
-        attachments = list(message.iter_attachments())
-        self.assertEqual(len(attachments), 1)
-        self.assertEqual(attachments[0].get_content_type(), 'text/html')
 
     @unittest.skipUnless(hasattr(os, 'O_NOFOLLOW'), 'Requiere Linux/openat')
     def test_report_files_are_private_and_links_rejected(self):

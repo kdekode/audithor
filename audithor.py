@@ -14,9 +14,6 @@ import time
 import zlib
 import html
 import secrets
-import subprocess
-from email.message import EmailMessage
-from email.policy import SMTP
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -31,8 +28,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 5
-VERSION = '0.7.0'
-MAIL_TO = 'notificacion@indexeomarketing.com'
+VERSION = '0.8.0'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -186,9 +182,9 @@ def wait_for_capacity(gentle=False):
 
 
 class Budget:
-    def __init__(self, seconds, mib, gentle=False, continuous=False):
+    def __init__(self, seconds, mib, gentle=False, continuous=False, rapid=False):
         self.end = time.monotonic() + seconds
-        self.maximum = mib * 1024 * 1024
+        self.maximum = int(mib * 1024 * 1024)
         self.read = 0
         self.steps = 0
         self.pressure = None
@@ -196,6 +192,13 @@ class Budget:
         self.continuous = continuous
         self.window_seconds = seconds
         self.window_bytes = self.maximum
+        self.rapid = rapid
+        self.tail = False
+        self.started = time.monotonic()
+        self.cpu_mark = time.process_time()
+        self.wall_mark = self.started
+        self.high_load = False
+        self.checked_step = -1
 
     def exhausted(self):
         if self.continuous:
@@ -208,8 +211,13 @@ class Budget:
                 self.end = time.monotonic() + self.window_seconds
                 self.maximum = self.read + self.window_bytes
             return False
-        if self.steps % 250 == 0:
-            self.pressure = pressure(self.gentle)
+        if self.steps % 128 == 0 and self.steps != self.checked_step:
+            self.checked_step = self.steps
+            self.pressure = pressure(self.gentle, rapid=self.rapid)
+            try:
+                self.high_load = os.getloadavg()[0] > (os.cpu_count() or 1) * LOAD_PER_CPU
+            except (AttributeError, OSError):
+                pass
         if self.pressure:
             return True
         return self.read >= self.maximum or time.monotonic() >= self.end
@@ -217,8 +225,18 @@ class Budget:
     def tick(self, size):
         self.read += size
         self.steps += 1
-        # Pausa también en fragmentos descartados o descomprimidos.
-        time.sleep(.01 if self.gentle else .001)
+        # Limitar trabajo por bloques, no dormir 10 ms en cada línea.
+        if self.steps % 128 == 0:
+            now = time.monotonic()
+            cpu = time.process_time()
+            duty = .02 if self.high_load else .05 if self.gentle else .10
+            rate = 256 * 1024 if self.high_load else 512 * 1024 if self.gentle else 2 * 1024 * 1024
+            delay = max(0, (cpu - self.cpu_mark) / duty - (now - self.wall_mark),
+                        self.read / rate - (now - self.started))
+            if delay:
+                time.sleep(min(delay, .25))
+            self.cpu_mark = time.process_time()
+            self.wall_mark = time.monotonic()
 
 
 def host_status():
@@ -230,11 +248,11 @@ def host_status():
     return max(1, os.cpu_count() or 1), os.getloadavg(), int(available[1]) / 1024
 
 
-def pressure_reason(status, gentle=False):
+def pressure_reason(status, gentle=False, rapid=False):
     cpus, loads, available = status
     factor = LOAD_PER_CPU
     limit = cpus * factor
-    if loads[0] > limit:
+    if loads[0] > limit and not rapid:
         return (f'Carga media 1 min: {loads[0]:.2f}; umbral: {limit:.2f} '
                 f'({cpus} CPU lógicas × {factor:g}). Análisis aplazado. Usa --diagnose para ver el estado.')
     if available < 256:
@@ -242,10 +260,10 @@ def pressure_reason(status, gentle=False):
     return None
 
 
-def pressure(gentle=False):
+def pressure(gentle=False, rapid=False):
     """Guardas aproximadas del host; no son métricas por dominio."""
     try:
-        return pressure_reason(host_status(), gentle)
+        return pressure_reason(host_status(), gentle, rapid)
     except (OSError, AttributeError, ValueError):
         return 'No se pudo comprobar la presión del host; análisis aplazado. Usa --diagnose.'
 
@@ -258,6 +276,15 @@ def scan(parent, name, budget, state):
             return
         state['inodes'].add(key)
         packed = name.endswith('.gz')
+        if budget.tail and not packed and initial.st_size > budget.maximum - budget.read:
+            raw.seek(max(0, initial.st_size - (budget.maximum - budget.read)))
+            # Descartar la primera línea cortada dentro del mismo presupuesto.
+            while not budget.exhausted():
+                fragment = raw.readline(min(16384, budget.maximum - budget.read))
+                budget.tick(len(fragment))
+                if not fragment or fragment.endswith(b'\n'):
+                    break
+            state['notes'].add('Vista rápida: cola del log activo; no es el total del día.')
         stream = gzip.GzipFile(fileobj=raw, mode='rb') if packed else raw
         try:
             while not budget.exhausted():
@@ -344,13 +371,35 @@ def historical_order(files, fd, historical):
     return sorted(files, key=key)
 
 
+def quick_files(files, historical, day_offset=1, single_base=None):
+    """Una rotación probable por familia HTTP/HTTPS; nunca inferir cobertura completa."""
+    groups = collections.defaultdict(list)
+    for name in files:
+        match = re.match(r'^(?:proxy_)?access(?:_ssl)?_log', name)
+        base = single_base or (match[0] if match else None)
+        if base:
+            groups[base].append(name)
+    selected = set()
+    for base, group in groups.items():
+        rotations = [n for n in group if re.search(r'\.\d+(?:\.gz)?$', n)]
+        if historical and rotations:
+            selected.add(min(rotations, key=lambda n: (abs(int(re.search(r'\.(\d+)(?:\.gz)?$', n)[1]) - max(1, day_offset)), n)))
+        elif historical and any('.processed' in n for n in group):
+            selected.add(next(n for n in group if '.processed' in n))
+        elif base in group:
+            selected.add(base)
+        else:
+            selected.add(group[0])
+    return [name for name in files if name in selected]
+
+
 def read_fail2ban(args):
     result = dict(ips=set(), jails=collections.Counter(), events=0, notes=set(), inodes=set(),
                   day_seen=False, read=0)
     if args.no_fail2ban:
         result['notes'].add('Integración Fail2Ban desactivada por --no-fail2ban.')
         return result
-    budget = Budget(min(args.seconds, 30), min(args.max_mib, 16), args.gentle)
+    budget = Budget(min(args.seconds, 3), min(args.max_mib, 2), args.gentle, rapid=True)
     parent, basename = os.path.split(os.path.abspath(args.fail2ban_log))
     fd = None
     try:
@@ -360,7 +409,13 @@ def read_fail2ban(args):
             raise ValueError('Demasiados históricos Fail2Ban.')
         if not files:
             result['notes'].add('No se encontró el log de Fail2Ban. Puede usar journald/syslog u otra ruta.')
-        for name in historical_order(files, fd, args.historical):
+        files = historical_order(files, fd, args.historical)
+        if not getattr(args, 'full', False):
+            chosen = quick_files(files, args.historical, getattr(args, 'day_offset', 1), basename)
+            if len(chosen) < len(files):
+                result['notes'].add('Fail2Ban rápido: se omiten otras rotaciones; no es el total histórico.')
+            files = chosen
+        for name in files:
             if name.endswith('.gz') and not args.gzip:
                 result['notes'].add('Históricos gzip de Fail2Ban omitidos para hoy; usa --gzip para incluirlos.')
                 continue
@@ -429,7 +484,7 @@ def activity_level(peak):
 
 
 def analyze(root, domain, day, zone, args):
-    detailed = bool(args.domain or getattr(args, 'report', False) or getattr(args, 'send', False))
+    detailed = bool(args.domain or getattr(args, 'report', False))
     state = dict(inodes=set(), notes=set(), counts=collections.Counter(), urls=collections.Counter(),
                  bytes_urls=collections.Counter(), errors=collections.Counter(), statuses=collections.Counter(),
                  internal=collections.Counter(),
@@ -438,7 +493,9 @@ def analyze(root, domain, day, zone, args):
                  total=0, bytes=0, invalid=0, earliest=None, latest=None)
     bans = getattr(args, 'bans', None)
     state['f2b_matches'] = 0 if bans and bans['day_seen'] else None
-    budget = Budget(args.seconds, args.max_mib, args.gentle, continuous=not getattr(args, 'sample', False))
+    continuous = not getattr(args, 'sample', False)
+    state['rapid'] = not continuous
+    budget = Budget(args.seconds, args.max_mib, args.gentle, continuous=continuous, rapid=not continuous)
     try:
         fd = directory(domain + '/logs', root)
     except OSError as exc:
@@ -453,10 +510,26 @@ def analyze(root, domain, day, zone, args):
             state['notes'].add('No hay logs de acceso legibles seleccionados.')
         # Más reciente primero: útil para hoy con presupuesto acotado.
         files = historical_order(files, fd, args.historical)
-        for name in files:
+        if not continuous:
+            chosen = quick_files(files, args.historical, getattr(args, 'day_offset', 1))
+            state['notes'].add('VISTA RÁPIDA: muestra de archivos probables; no es el total del día. Usa --full para ampliar.')
+            if len(chosen) < len(files):
+                state['notes'].add(f'Se omiten {len(files) - len(chosen)} archivos de otras rotaciones.')
+            files = chosen
+        state['selected_files'] = files[:2] if not continuous else []
+        total_end, total_maximum = budget.end, budget.maximum
+        for index, name in enumerate(files):
+            if not continuous:
+                budget.end, budget.maximum = total_end, total_maximum
             if budget.exhausted():
                 state['notes'].add((budget.pressure or 'Quedan archivos sin leer.') + ' Resultado PARCIAL.')
                 break
+            if not continuous:
+                # Repartir el presupuesto entre HTTP y HTTPS, no gastarlo en el primero.
+                remaining_files = len(files) - index
+                budget.end = time.monotonic() + max(0, total_end - time.monotonic()) / remaining_files
+                budget.maximum = budget.read + max(1, (total_maximum - budget.read) // remaining_files)
+                budget.tail = not args.historical
             try:
                 for line in scan(fd, name, budget, state):
                     event = parse(line, zone)
@@ -497,7 +570,16 @@ def analyze(root, domain, day, zone, args):
             except (OSError, EOFError, ValueError, zlib.error) as exc:
                 state['notes'].add('No se pudo completar ' + clean(name) + ': ' + clean(str(exc)))
         if detailed:
+            if not continuous:
+                access_read = budget.read
+                budget = Budget(min(args.seconds, 2), min(args.max_mib, 2), args.gentle, rapid=True)
             errorfiles = [n for n in names(fd, 4096) if re.fullmatch(r'(?:proxy_error_log|error_log)(?:\.\d+)?(?:\.gz)?', n)]
+            if not continuous and errorfiles:
+                errorbase = 'proxy_error_log' if layer == 'nginx' else 'error_log'
+                errorfiles = [n for n in errorfiles if re.fullmatch(re.escape(errorbase) + r'(?:\.\d+)?(?:\.gz)?', n)]
+                errorfiles = historical_order(errorfiles, fd, args.historical)
+                errorfiles = quick_files(errorfiles, args.historical, getattr(args, 'day_offset', 1), errorbase)
+                state['notes'].add('Errores internos: lectura rápida limitada a archivos seleccionados de la capa elegida.')
             if len(errorfiles) > 128:
                 state['notes'].add('Demasiados logs internos; no se analizaron.')
             else:
@@ -515,6 +597,8 @@ def analyze(root, domain, day, zone, args):
                                 state['internal'][event[1]] += 1
                     except (OSError, EOFError, ValueError, zlib.error):
                         state['notes'].add('No se pudo completar un log interno.')
+            if not continuous:
+                budget.read += access_read
     finally:
         os.close(fd)
     state['read'] = budget.read
@@ -549,8 +633,12 @@ def show(domain, day, result, detail=False):
     print('\n' + '=' * 80)
     print(' ' + domain)
     print(f' Fecha: {day}   |   Datos observados, cobertura del día no garantizada')
+    if result.get('rapid'):
+        print(' VISTA RÁPIDA · MUESTRA: las cifras no son el total diario.')
     if result.get('layer'):
         print(' Fuente de accesos: ' + result['layer'].upper() + ' (una sola capa)')
+    for name in result.get('selected_files', []):
+        print(' Archivo seleccionado: ' + clean(name, 56))
     print('=' * 80 + '\n')
     metrics = [
         ('Peticiones de la fecha leídas', f'{total:,}' if known else 'N/D'),
@@ -621,6 +709,8 @@ def compact_summary(result):
     summary = {key: result[key] for key in ('total', 'bytes', 'earliest', 'latest')}
     summary['read'] = result.get('read', 0)
     summary['layer'] = result.get('layer')
+    summary['rapid'] = result.get('rapid', False)
+    summary['selected_files'] = result.get('selected_files', [])
     for key in ('http4', 'http5', 'sensitive', 'sensitive4', 'peak'):
         summary[key] = result.get(key, 0)
     summary['peak_minute'] = result.get('peak_minute')
@@ -664,7 +754,7 @@ def show_review_page(rows, start=1):
 def next_batch(args):
     if getattr(args, 'once', False):
         return False
-    if getattr(args, 'report', False) or getattr(args, 'send', False):
+    if getattr(args, 'report', False):
         return True
     if not sys.stdin.isatty():
         print('Sin terminal interactiva: termino tras cinco dominios. Usa --report para auditar todos.')
@@ -703,6 +793,7 @@ def html_section(domain, result, args):
         ('Minuto del pico', result.get('peak_minute') or 'N/D'),
         ('IP coincidentes con eventos Ban del día', result.get('f2b_matches') if result.get('f2b_matches') is not None else 'N/D'),
         ('Fuente de accesos', result.get('layer', 'N/D')),
+        ('Archivos de la muestra', ', '.join(result.get('selected_files', [])) or 'Lectura ampliada / sin selección disponible'),
         ('Fechas encontradas en los logs', f'{result.get("earliest")} a {result.get("latest")}'),
     ]
     output = '<section><h2>' + esc(domain) + '</h2>' + html_table(('Métrica', 'Resultado'), metrics)
@@ -815,46 +906,13 @@ class HtmlAudit:
             self.finished = True
 
 
-def send_audit(path, day):
-    """Solo se llama con --send. No instala/configura el MTA ni usa una shell."""
-    mailer = '/usr/sbin/sendmail'
-    if not os.path.isfile(mailer) or not os.access(mailer, os.X_OK):
-        raise RuntimeError('No existe /usr/sbin/sendmail operativo. HTML guardado; no se ha instalado ni configurado correo.')
-    parent = directory(os.path.dirname(path))
-    try:
-        with regular(parent, os.path.basename(path)) as stream:
-            payload = stream.read(HtmlAudit.MAX_BYTES + 1)
-    finally:
-        os.close(parent)
-    if len(payload) > HtmlAudit.MAX_BYTES:
-        raise ValueError('El HTML supera el límite de 2 MiB para correo.')
-    message = EmailMessage(policy=SMTP)
-    message['From'] = MAIL_TO
-    message['To'] = MAIL_TO
-    message['Subject'] = f'Audithor · auditoría de tráfico · {day}'
-    message.set_content('Adjunto el informe HTML de los logs disponibles. Las señales son orientativas; revisa los avisos de cobertura.')
-    message.add_attachment(payload, maintype='text', subtype='html', filename=os.path.basename(path))
-    try:
-        result = subprocess.run([mailer, '-oi', '-t'], input=message.as_bytes(),
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                timeout=20, check=False, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'})
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError('No se confirmó la aceptación del correo; no se reintentó. El HTML sigue guardado.') from exc
-    if result.returncode:
-        raise RuntimeError(f'El correo local devolvió código {result.returncode}. El HTML sigue guardado.')
-    print(f'Correo aceptado por el servicio local para {MAIL_TO}; esto no confirma su entrega final.', flush=True)
-
-
 def finish_audit(args, rows):
     if not getattr(args, 'audit', None):
         return
     complete = args.audit.finish(rows)
     print('\nHTML privado guardado en: ' + args.audit.path, flush=True)
-    if args.send:
-        if complete:
-            send_audit(args.audit.path, args.day)
-        else:
-            print('No envío correo: el informe quedó interrumpido o alcanzó el límite de tamaño.')
+    if not complete:
+        print('El informe tiene avisos, límites o dominios pendientes; revisa su cobertura.')
 
 
 def collect_ranked(root, domains, day, zone, args):
@@ -865,7 +923,7 @@ def collect_ranked(root, domains, day, zone, args):
             if number > 1 and (number - 1) % PAGE_SIZE == 0 and not next_batch(args):
                 break
             if getattr(args, 'sample', False):
-                reason = pressure(args.gentle)
+                reason = pressure(args.gentle, rapid=True)
                 if reason:
                     print(f'\nRecorrido incompleto: {reason}', flush=True)
                     break
@@ -908,17 +966,17 @@ def arguments(argv=None):
     parser.add_argument('--gzip', action='store_true', help='Incluir históricos comprimidos dentro del mismo presupuesto')
     parser.add_argument('--no-fail2ban', action='store_true', help='Omitir lectura del historial Fail2Ban')
     parser.add_argument('--fail2ban-log', default='/var/log/fail2ban.log', help='Archivo de historial Fail2Ban, sin modificarlo')
-    parser.add_argument('--report', action='store_true', help='Auditar todos y guardar un HTML detallado privado, sin correo')
-    parser.add_argument('--send', action='store_true', help='Auditar todos, guardar HTML y solicitar envío al correo configurado')
-    parser.add_argument('--seconds', type=int, default=30, help='Segundos por tanda; límite total por dominio solo con --sample (1–1800)')
-    parser.add_argument('--max-mib', type=int, default=64, help='MiB descomprimidos por tanda; límite total solo con --sample (1–1024)')
+    parser.add_argument('--report', action='store_true', help='Guardar HTML local de todos los dominios; usa --full para ampliar la lectura')
+    parser.add_argument('--seconds', type=int, default=5, help='Segundos por dominio en vista rápida; por tanda con --full (1–1800)')
+    parser.add_argument('--max-mib', type=int, default=8, help='MiB descomprimidos por dominio; por tanda con --full (1–1024)')
     parser.add_argument('--once', action='store_true', help='Analizar únicamente la primera tanda de cinco dominios')
     parser.add_argument('--diagnose', action='store_true', help='Mostrar carga, CPU lógicas y memoria; sin analizar dominios')
-    parser.add_argument('--gentle', action='store_true', help='Modo lento: pausa 10 ms/línea, umbral de carga 1 por CPU lógica')
-    parser.add_argument('--sample', action='store_true', help='Solo muestra acotada por dominio; sin esta opción continúa hasta acabar')
+    parser.add_argument('--gentle', action='store_true', help='Reduce los objetivos de CPU y lectura del propio proceso')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--full', action='store_true', help='Recorrer todos los históricos; puede tardar mucho y esperar por carga')
+    modes.add_argument('--sample', action='store_true', help='Vista rápida limitada (ya es el modo predeterminado)')
     args = parser.parse_args(argv)
-    if args.report or args.send:
-        args.gentle = True
+    args.sample = not args.full
     if args.domain and not DOMAIN.fullmatch(args.domain):
         parser.error('Dominio no válido. Usa su nombre ASCII exacto, sin URL ni rutas.')
     if not 1 <= args.seconds <= 1800 or not 1 <= args.max_mib <= 1024:
@@ -932,6 +990,7 @@ def arguments(argv=None):
         if args.day > today:
             parser.error('No se pueden analizar fechas futuras.')
         args.historical = args.day < today
+        args.day_offset = (today - args.day).days
         # --yesterday debe buscar automáticamente en los históricos comprimidos.
         args.gzip = args.gzip or args.historical
     except (ValueError, ZoneInfoNotFoundError):
@@ -947,10 +1006,10 @@ def main(argv=None):
         print(f'CPU lógicas detectadas: {cpus}')
         print('Carga media 1/5/15 min: ' + ' / '.join(f'{load:.2f}' for load in loads))
         factor = LOAD_PER_CPU
-        print(f'Umbral de Audithor: {cpus * factor:.2f} ({factor:g} por CPU lógica)')
+        print(f'Umbral de espera solo para --full: {cpus * factor:.2f} ({factor:g} por CPU lógica)')
         print(f'MemAvailable: {available:.0f} MiB; mínimo: 256 MiB')
         print('La carga media NO es un porcentaje de CPU; puede incluir espera de disco.')
-        print(pressure_reason(status, args.gentle) or 'Las guardas actuales permiten iniciar el análisis.')
+        print(pressure_reason(status, args.gentle, rapid=True) or 'Vista rápida: memoria suficiente; con carga alta reduce su ritmo, sin esperar indefinidamente.')
         print('Diagnóstico de solo lectura; no se han abierto logs de dominios.')
         return 0
     # Cambia únicamente la prioridad y los límites de ESTE proceso.
@@ -967,21 +1026,18 @@ def main(argv=None):
     print(f'Fecha: {args.day} ({args.timezone}). Secuencial; memoria virtual máxima 128 MiB.')
     print(f'Tandas de {args.seconds}s/{args.max_mib} MiB. ' + ('MUESTRA limitada por dominio.' if args.sample else 'LECTURA CONTINUA: descansa y continúa hasta finalizar los archivos seleccionados.'))
     print('Logs en solo lectura. Sin instalaciones, cron ni cambios en Plesk, servicios o permisos de las webs.')
-    if args.report or args.send:
+    if args.report:
         print('Modo auditoría: todos los dominios seleccionados, sin esperar start; HTML privado en reports/.')
-    if args.send:
-        print('Correo solicitado a ' + MAIL_TO + ' usando únicamente /usr/sbin/sendmail ya instalado.')
-        if not os.path.isfile('/usr/sbin/sendmail') or not os.access('/usr/sbin/sendmail', os.X_OK):
-            print('AVISO: no se detecta correo local operativo; el HTML se guardará, pero el envío no podrá realizarse.')
     print('Bots y humanos son estimaciones. Las señales no confirman ataques.')
     if args.historical:
         print('Fecha histórica: gzip incluido automáticamente; prioridad a logs rotados.')
     if args.gentle:
-        print('Modo lento: pausa de 10 ms por línea/fragmento (aprox. máximo 100/s); umbral 1 por CPU lógica.')
+        print('Modo suave: objetivos aproximados de CPU/lectura más bajos; regulación por bloques.')
     if args.sample:
-        reason = pressure(args.gentle)
+        reason = pressure(args.gentle, rapid=True)
         if reason:
             raise RuntimeError(reason)
+        print('VISTA RÁPIDA: archivos probables de la fecha; límites por dominio, sin espera indefinida por carga.')
     else:
         wait_for_capacity(args.gentle)
     root = directory(args.root)
@@ -992,12 +1048,12 @@ def main(argv=None):
             print('No se encontraron dominios accesibles.')
             return 0
         args.bans = None
-        if args.domain or args.report or args.send:
+        if args.domain or args.report:
             print('\nLeyendo historial Fail2Ban…', flush=True)
             args.bans = read_fail2ban(args)
             if args.domain:
                 show_fail2ban(args.bans, args.day)
-        if args.report or args.send:
+        if args.report:
             args.audit = HtmlAudit(args, len(domains))
             print('Creando informe privado: ' + args.audit.path, flush=True)
         if args.domain:
@@ -1012,7 +1068,7 @@ def main(argv=None):
         finish_audit(args, rows)
         for offset in range(0, len(rows), PAGE_SIZE):
             show_review_page(rows[offset:offset+PAGE_SIZE], offset+1)
-            if offset + PAGE_SIZE >= len(rows) or args.once or args.report or args.send or not sys.stdin.isatty():
+            if offset + PAGE_SIZE >= len(rows) or args.once or args.report or not sys.stdin.isatty():
                 break
             if input(f'\nEnter: siguientes {PAGE_SIZE} | q + Enter: salir > ').strip().lower() in ('q', 'salir'):
                 break
