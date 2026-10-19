@@ -12,9 +12,11 @@ import stat
 import sys
 import time
 import zlib
+from urllib.parse import unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-BANNER = r"""+    _   _   _ ____ ___ _____ _   _  ___  ____
+BANNER = r"""
+    _   _   _ ____ ___ _____ _   _  ___  ____
    / \ | | | |  _ \_ _|_   _| | | |/ _ \|  _ \
   / _ \| | | | | | | |  | | | |_| | | | | |_) |
  / ___ \ |_| | |_| | |  | | |  _  | |_| |  _ <
@@ -23,6 +25,7 @@ BANNER = r"""+    _   _   _ ____ ___ _____ _   _  ___  ____
 """
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
+PAGE_SIZE = 5
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -30,6 +33,7 @@ BOT = re.compile(r'bot|crawler|spider|slurp|bingpreview', re.I)
 AUTO = re.compile(r'curl|wget|python|sqlmap|nikto|go-http-client|headless|selenium', re.I)
 BROWSER = re.compile(r'Mozilla/5\.0.*(?:Firefox/|Chrome/|Safari/|Edg/)', re.I)
 SENSITIVE = re.compile(r'(?:^|/)(?:\.env|\.git|wp-login\.php|xmlrpc\.php|phpmyadmin)(?:[/.]|$)', re.I)
+BAN = re.compile(r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?\s+fail2ban\.actions\s+(?:\[\d+\])?:?\s+[A-Z]+\s+\[([^\]]{1,120})\]\s+Ban\s+(\S+)\s*$')
 
 
 def clean(value, limit=180):
@@ -64,7 +68,8 @@ def parse(line, zone):
         ua = m[7].decode('utf-8', 'replace')[:512]
         kind = ('bot' if BOT.search(ua) or AUTO.search(ua) else
                 'probable' if BROWSER.search(ua) and not SENSITIVE.search(path) else 'unknown')
-        return stamp.date(), path, int(m[5]), int(m[6]) if m[6] != b'-' else 0, kind
+        return (stamp.date(), path, int(m[5]), int(m[6]) if m[6] != b'-' else 0, kind,
+                str(ipaddress.ip_address(m[1].decode('ascii'))), stamp.strftime('%Y-%m-%d %H:%M %z'))
     except (ValueError, KeyError, UnicodeError, OverflowError):
         return None
 
@@ -239,9 +244,9 @@ def scan(parent, name, budget, state):
                 stream.close()
 
 
-def increment(table, key, value=1):
+def increment(table, key, value=1, overflow='[otras rutas: límite de memoria]'):
     if key not in table and len(table) >= 2000:
-        key = '[otras rutas: límite de memoria]'
+        key = overflow
     table[key] += value
 
 
@@ -249,7 +254,7 @@ def error_event(line):
     """Solo fecha y categoría; nunca imprimir mensajes internos ni secretos."""
     text = line.decode('utf-8', 'replace')
     nginx = re.match(r'^(\d{4})/(\d{2})/(\d{2}) ', text)
-    apache = re.match(r'^\[[A-Za-z]{3} ([A-Za-z]{3}) (\d{1,2}) [0-9:.]+ (\d{4})\]', text)
+    apache = re.match(r'^\[[A-Za-z]{3} ([A-Za-z]{3})\s+(\d{1,2}) [0-9:.]+ (\d{4})\]', text)
     try:
         if nginx:
             day = dt.date(*map(int, nginx.groups()))
@@ -270,11 +275,117 @@ def error_event(line):
     return day, category
 
 
+def parse_ban(line):
+    text = line.decode('utf-8', 'replace').strip()
+    match = BAN.fullmatch(text)
+    if not match:
+        return None
+    try:
+        return dt.date.fromisoformat(text[:10]), clean(match[1], 80), str(ipaddress.ip_address(match[2]))
+    except ValueError:
+        return None
+
+
+def historical_order(files, fd, historical):
+    # No filtrar por mtime: solo priorizar; no equivale a la fecha del contenido.
+    def key(name):
+        rotated = bool(re.search(r'\.processed|\.\d+(?:\.gz)?$|\.gz$', name))
+        mtime = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mtime
+        return (not rotated if historical else False, -mtime)
+    return sorted(files, key=key)
+
+
+def read_fail2ban(args):
+    result = dict(ips=set(), jails=collections.Counter(), events=0, notes=set(), inodes=set(),
+                  day_seen=False, read=0)
+    if args.no_fail2ban:
+        result['notes'].add('Integración Fail2Ban desactivada por --no-fail2ban.')
+        return result
+    budget = Budget(min(args.seconds, 30), min(args.max_mib, 16), args.gentle)
+    parent, basename = os.path.split(os.path.abspath(args.fail2ban_log))
+    fd = None
+    try:
+        fd = directory(parent)
+        files = [n for n in names(fd, 10000) if re.fullmatch(re.escape(basename) + r'(?:\.\d+)?(?:\.gz)?', n)]
+        if len(files) > 128:
+            raise ValueError('Demasiados históricos Fail2Ban.')
+        if not files:
+            result['notes'].add('No se encontró el log de Fail2Ban. Puede usar journald/syslog u otra ruta.')
+        for name in historical_order(files, fd, args.historical):
+            if name.endswith('.gz') and not args.gzip:
+                result['notes'].add('Históricos gzip de Fail2Ban omitidos para hoy; usa --gzip para incluirlos.')
+                continue
+            if budget.exhausted():
+                result['notes'].add('Lectura Fail2Ban incompleta por presupuesto o carga.')
+                break
+            try:
+                for line in scan(fd, name, budget, result):
+                    # Fail2Ban suele registrar hora local sin offset; no inventar una conversión.
+                    if line[:10] == args.day.isoformat().encode() and b'fail2ban.' in line:
+                        result['day_seen'] = True
+                    event = parse_ban(line)
+                    if not event or event[0] != args.day:
+                        continue
+                    _, jail, ip = event
+                    result['events'] += 1
+                    if ip in result['ips'] or len(result['ips']) < 20000:
+                        result['ips'].add(ip)
+                    else:
+                        result['notes'].add('Límite de 20 000 IP Fail2Ban: coincidencias y únicas son parciales.')
+                    if jail not in result['jails'] and len(result['jails']) >= 100:
+                        jail = '[otras jails]'
+                    result['jails'][jail] += 1
+            except (OSError, EOFError, ValueError, zlib.error):
+                result['notes'].add('No se pudo completar un histórico de Fail2Ban.')
+    except (OSError, ValueError, RuntimeError) as exc:
+        result['notes'].add('Fail2Ban no disponible: ' + clean(str(exc), 180))
+    finally:
+        if fd is not None:
+            os.close(fd)
+    result['read'] = budget.read
+    return result
+
+
+def show_fail2ban(result, day):
+    print('\n' + '=' * 80)
+    print(f' FAIL2BAN · SERVIDOR · {day}')
+    print('=' * 80)
+    if result['day_seen']:
+        print(f'  Eventos Ban observados: {result["events"]:,}    IP únicas observadas: {len(result["ips"]):,}')
+        for jail, count in result['jails'].most_common(8):
+            print(f'  {jail:<36} {count:>10,} eventos')
+    else:
+        print('  N/D: no se leyeron mensajes de Fail2Ban para esta fecha.')
+    print('  Histórico declarado por Fail2Ban; no indica bloqueos actualmente activos.')
+    print('  Hora local escrita en el log. Cobertura y retención no garantizadas.')
+    for note in sorted(result['notes']):
+        print('  AVISO: ' + note)
+    print()
+
+
+def signals(result):
+    total = result['total']
+    findings = []
+    if result.get('sensitive', 0) >= 20:
+        findings.append('Accesos a rutas sensibles: ' + str(result['sensitive']))
+    if total >= 100 and result.get('http4', 0) / total >= .5:
+        findings.append('Al menos 50% de respuestas 4xx')
+    if total >= 20 and result.get('http5', 0) / total >= .1:
+        findings.append('Al menos 10% de respuestas 5xx')
+    if result.get('peak', 0) >= 300:
+        findings.append('Pico observado de al menos 300 peticiones/minuto')
+    return findings
+
+
 def analyze(root, domain, day, zone, args):
     state = dict(inodes=set(), notes=set(), counts=collections.Counter(), urls=collections.Counter(),
                  bytes_urls=collections.Counter(), errors=collections.Counter(), statuses=collections.Counter(),
                  internal=collections.Counter(),
+                 ip_counts=collections.Counter(), minutes=collections.Counter(), sensitive_urls=collections.Counter(),
+                 f2b_seen=set(), sensitive=0, http4=0, http5=0, peak=0,
                  total=0, bytes=0, invalid=0, earliest=None, latest=None)
+    bans = getattr(args, 'bans', None)
+    state['f2b_matches'] = 0 if bans and bans['day_seen'] else None
     budget = Budget(args.seconds, args.max_mib, args.gentle)
     try:
         fd = directory(domain + '/logs', root)
@@ -289,7 +400,7 @@ def analyze(root, domain, day, zone, args):
         if not files:
             state['notes'].add('No hay logs de acceso legibles seleccionados.')
         # Más reciente primero: útil para hoy con presupuesto acotado.
-        files.sort(key=lambda n: os.stat(n, dir_fd=fd, follow_symlinks=False).st_mtime, reverse=True)
+        files = historical_order(files, fd, args.historical)
         for name in files:
             if budget.exhausted():
                 state['notes'].add((budget.pressure or 'Quedan archivos sin leer.') + ' Resultado PARCIAL.')
@@ -300,7 +411,7 @@ def analyze(root, domain, day, zone, args):
                     if event is None:
                         state['invalid'] += 1
                         continue
-                    date, path, status, size, kind = event
+                    date, path, status, size, kind, ip, minute = event
                     state['earliest'] = min(date, state['earliest'] or date)
                     state['latest'] = max(date, state['latest'] or date)
                     if date != day:
@@ -309,10 +420,25 @@ def analyze(root, domain, day, zone, args):
                     state['bytes'] += size
                     state['counts'][kind] += 1
                     state['statuses'][status] += 1
-                    increment(state['urls'], path)
-                    increment(state['bytes_urls'], path, size)
-                    if status >= 400:
-                        increment(state['errors'], str(status) + ' ' + path)
+                    state['http4'] += int(400 <= status < 500)
+                    state['http5'] += int(status >= 500)
+                    probe = bool(SENSITIVE.search(unquote(path)))
+                    state['sensitive'] += int(probe)
+                    # Un día tiene <=1500 minutos con cambio horario; límite defensivo.
+                    if minute in state['minutes'] or len(state['minutes']) < 1600:
+                        state['minutes'][minute] += 1
+                        state['peak'] = max(state['peak'], state['minutes'][minute])
+                    if bans and ip in bans['ips']:
+                        state['f2b_seen'].add(ip)
+                    if args.domain:
+                        increment(state['ip_counts'], ip, overflow='[otras IP: límite de memoria]')
+                        if probe:
+                            increment(state['sensitive_urls'], path)
+                    if args.domain:
+                        increment(state['urls'], path)
+                        increment(state['bytes_urls'], path, size)
+                        if status >= 400:
+                            increment(state['errors'], str(status) + ' ' + path)
             except (OSError, EOFError, ValueError, zlib.error) as exc:
                 state['notes'].add('No se pudo completar ' + clean(name) + ': ' + clean(str(exc)))
         if args.domain:
@@ -337,42 +463,122 @@ def analyze(root, domain, day, zone, args):
     finally:
         os.close(fd)
     state['read'] = budget.read
+    if state['f2b_matches'] is not None:
+        state['f2b_matches'] = len(state['f2b_seen']) if state['read'] else None
     if state['invalid']:
         state['notes'].add(f"{state['invalid']} líneas no interpretadas; cobertura parcial.")
     return state
 
 
+def table(headers, rows, widths):
+    def row(values):
+        cells = []
+        for value, width in zip(values, widths):
+            text = clean(value, 1000)
+            if len(text) > width:
+                text = text[:width-3] + '...'
+            cells.append(text.ljust(width))
+        return '  '.join(cells)
+    print('  ' + row(headers))
+    print('  ' + '  '.join('-' * width for width in widths))
+    for values in rows:
+        print('  ' + row(values))
+
+
 def show(domain, day, result, detail=False):
     total = result['total']
+    known = bool(result.get('read', 0))
     pct = lambda k: f"{100 * result['counts'][k] / total:.1f}%" if total else 'N/D'
-    print(f'\n{domain} | {day} | {total:,} peticiones observadas | {result["bytes"]/1048576:.2f} MiB enviados')
-    print(f'  Bots/automatización probable: {pct("bot")} | humano probable: {pct("probable")} | desconocido: {pct("unknown")}')
-    print('  IP bloqueadas del día: N/D | RAM diaria: N/D | CPU diaria: N/D')
+    count_pct = lambda n: f'{n:,} / {100*n/total:.1f}%' if total else 'N/D'
+    f2b = result.get('f2b_matches')
+    print('\n' + '=' * 80)
+    print(' ' + domain)
+    print(f' Fecha: {day}   |   Datos observados, cobertura del día no garantizada')
+    print('=' * 80 + '\n')
+    table(('TRÁFICO', 'VALOR', 'SEÑALES', 'VALOR'), [
+        ('Peticiones', f'{total:,}' if known else 'N/D', 'HTTP 4xx', count_pct(result.get('http4', 0))),
+        ('Transferencia', f'{result["bytes"]/1048576:.2f} MiB' if known else 'N/D', 'HTTP 5xx', count_pct(result.get('http5', 0))),
+        ('Bots/automatización', pct('bot'), 'Rutas sensibles', f'{result.get("sensitive", 0):,}' if known else 'N/D'),
+        ('Humano probable', pct('probable'), 'Pico peticiones/min', f'{result.get("peak", 0):,}' if known else 'N/D'),
+        ('Desconocido', pct('unknown'), 'IP coincidentes F2B', f'{f2b:,}' if f2b is not None else 'N/D'),
+    ], (22, 14, 22, 14))
+    print('\n  F2B: IP vistas en esta web y con evento Ban en el servidor ese día.')
+    print('       Coincidencia; no demuestra que esta web originara el bloqueo.')
+    findings = signals(result)
+    if findings:
+        print('\n  REVISAR · Indicadores orientativos; no confirman un ataque:')
+        for finding in findings:
+            print('    - ' + finding)
+    elif known and total:
+        print('\n  Sin umbrales de alerta activados en la muestra; no descarta un ataque.')
+    else:
+        print('\n  Sin datos suficientes para valorar señales en esta fecha.')
     if not total:
-        print('  Sin peticiones observadas para esta fecha; NO confirma ausencia de tráfico.')
+        print('  No se observaron accesos de esta fecha; no confirma tráfico cero.')
     if result['earliest']:
-        print(f'  Fechas observadas en la lectura: {result["earliest"]} a {result["latest"]}.')
-    print('  Cobertura del día no garantizada: depende de retención, formato y rotación de logs.')
-    for note in sorted(result['notes']):
-        print('  AVISO: ' + note)
+        print(f'  Fechas encontradas: {result["earliest"]} a {result["latest"]}.')
+    if result['notes']:
+        print('\n  AVISOS DE LECTURA')
+        for note in sorted(result['notes']):
+            print('    - ' + note)
     if detail:
-        for title, key, unit in [('URLs con más peticiones', 'urls', 'peticiones'),
-                                 ('URLs con más transferencia (no equivale a CPU)', 'bytes_urls', 'bytes'),
-                                 ('Errores HTTP 4xx/5xx por URL', 'errors', 'peticiones')]:
-            print('\n  ' + title)
-            for path, count in result[key].most_common(10):
-                print(f'    {count:>12,} {unit}  {clean(path, 200)}')
-            if not result[key]:
-                print('    Sin datos observados.')
-        print('\n  Mensajes internos PHP/nginx/Apache (fecha local escrita en el log)')
-        for category, count in result['internal'].most_common():
-            print(f'    {count:>12,}  {category}')
+        for title, key, unit in [('URLs con más peticiones', 'urls', 'PETICIONES'),
+                                 ('URLs con más transferencia (no mide CPU)', 'bytes_urls', 'BYTES'),
+                                 ('Errores HTTP 4xx/5xx por URL', 'errors', 'PETICIONES'),
+                                 ('Accesos a rutas sensibles (incluye usos legítimos)', 'sensitive_urls', 'PETICIONES'),
+                                 ('IP con más peticiones (dirección registrada)', 'ip_counts', 'PETICIONES')]:
+            print('\n  ' + title + '\n')
+            rows = [(f'{count:,}', path) for path, count in result[key].most_common(10)]
+            table((unit, 'RUTA / IP'), rows, (12, 62))
+            if not rows:
+                print('  Sin datos observados.')
+        print('\n  Mensajes internos PHP/nginx/Apache (fecha local del log)\n')
+        table(('MENSAJES', 'CATEGORÍA'), [(str(count), category) for category, count in result['internal'].most_common()], (12, 62))
         if not result['internal']:
-            print('    Sin mensajes interpretados para la fecha; revisa los avisos de cobertura.')
+            print('  Sin mensajes interpretados para la fecha; revisa la cobertura.')
+        print('\n  Las IP pueden ser proxies/CDN. No se verifica su identidad ni se bloquean.')
+    print()
+
+
+def compact_summary(result):
+    """Retener solo cifras por dominio; nunca tablas de rutas o referencias al estado."""
+    summary = {key: result[key] for key in ('total', 'bytes', 'earliest', 'latest')}
+    summary['read'] = result.get('read', 0)
+    for key in ('http4', 'http5', 'sensitive', 'peak'):
+        summary[key] = result.get(key, 0)
+    summary['f2b_matches'] = result.get('f2b_matches')
+    summary['counts'] = collections.Counter({key: result['counts'][key] for key in ('bot', 'probable', 'unknown')})
+    notes = sorted(result['notes'])
+    summary['notes'] = [clean(note, 240) for note in notes[:8]]
+    if len(notes) > 8:
+        summary['notes'].append(f'{len(notes) - 8} avisos adicionales omitidos del resumen.')
+    return summary
+
+
+def collect_ranked(root, domains, day, zone, args):
+    rows = []
+    print('\nPreparando ranking global: se leerán los dominios uno a uno antes de mostrar las tandas.', flush=True)
+    for number, domain in enumerate(domains, 1):
+        reason = pressure(args.gentle)
+        if reason:
+            print(f'\nRanking incompleto: {reason}', flush=True)
+            break
+        print(f'  [{number}/{len(domains)}] Leyendo {domain}…', flush=True)
+        result = analyze(root, domain, day, zone, args)
+        rows.append((domain, compact_summary(result)))
+        del result
+    # Peticiones descendentes; bytes desempatan, nombre estabiliza el orden.
+    # La falta de lectura se coloca al final, sin confundirla con tráfico cero.
+    rows.sort(key=lambda row: (not bool(row[1]['read']), -row[1]['total'], -row[1]['bytes'], row[0]))
+    print(f'\nRanking por peticiones OBSERVADAS: {len(rows)}/{len(domains)} dominios consultados.')
+    print('No mide CPU/RAM. Lecturas parciales o históricos ausentes pueden alterar el orden real.')
+    if len(rows) < len(domains):
+        print(f'{len(domains) - len(rows)} dominios pendientes; no están incluidos en el ranking.')
+    return rows
 
 
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(description='Audithor — steev anderson. Logs Plesk, solo lectura, tres dominios por tanda.')
+    parser = argparse.ArgumentParser(description='Audithor — steev anderson. Logs Plesk, solo lectura, cinco dominios por tanda.')
     parser.add_argument('domain', nargs='?', help='Dominio exacto para informe detallado')
     dates = parser.add_mutually_exclusive_group()
     dates.add_argument('--yesterday', action='store_true', help='Ayer en la zona horaria elegida')
@@ -380,9 +586,11 @@ def arguments(argv=None):
     parser.add_argument('--timezone', default='Europe/Madrid')
     parser.add_argument('--root', default='/var/www/vhosts/system', help='Raíz de logs Plesk; no se modifica')
     parser.add_argument('--gzip', action='store_true', help='Incluir históricos comprimidos dentro del mismo presupuesto')
+    parser.add_argument('--no-fail2ban', action='store_true', help='Omitir lectura del historial Fail2Ban')
+    parser.add_argument('--fail2ban-log', default='/var/log/fail2ban.log', help='Archivo de historial Fail2Ban, sin modificarlo')
     parser.add_argument('--seconds', type=int, default=30, help='Tiempo máximo por dominio (1–1800, defecto 30)')
     parser.add_argument('--max-mib', type=int, default=64, help='Lectura máxima descomprimida por dominio (1–1024, defecto 64)')
-    parser.add_argument('--once', action='store_true', help='Solo tres dominios, sin esperar Enter')
+    parser.add_argument('--once', action='store_true', help='Mostrar solo el top 5; la vista global analiza antes todos los dominios')
     parser.add_argument('--diagnose', action='store_true', help='Mostrar carga, CPU lógicas y memoria; sin analizar dominios')
     parser.add_argument('--gentle', action='store_true', help='Modo lento: pausa 10 ms/línea, umbral de carga 1 por CPU lógica')
     args = parser.parse_args(argv)
@@ -398,6 +606,9 @@ def arguments(argv=None):
         args.day = dt.date.fromisoformat(args.date) if args.date else today - dt.timedelta(days=int(args.yesterday))
         if args.day > today:
             parser.error('No se pueden analizar fechas futuras.')
+        args.historical = args.day < today
+        # --yesterday debe buscar automáticamente en los históricos comprimidos.
+        args.gzip = args.gzip or args.historical
     except (ValueError, ZoneInfoNotFoundError):
         parser.error('Fecha o zona horaria no válida. Comprueba los datos tzdata del sistema.')
     return args
@@ -429,7 +640,9 @@ def main(argv=None):
     print(BANNER)
     print(f'Fecha: {args.day} ({args.timezone}). Secuencial; {args.seconds}s/{args.max_mib} MiB por dominio; memoria virtual máxima 128 MiB.')
     print('Solo lectura. Sin instalaciones, cron, procesos externos, conexiones de red ni cambios de permisos.')
-    print('Bots y humanos son estimaciones; no hay registros históricos de CPU/RAM ni atribución de bloqueos.')
+    print('Bots y humanos son estimaciones. Las señales no confirman ataques.')
+    if args.historical:
+        print('Fecha histórica: gzip incluido automáticamente; prioridad a logs rotados.')
     if args.gentle:
         print('Modo lento: pausa de 10 ms por línea/fragmento (aprox. máximo 100/s); umbral 1 por CPU lógica.')
     reason = pressure(args.gentle)
@@ -440,13 +653,22 @@ def main(argv=None):
         domains = [args.domain] if args.domain else discover(root)
         if not domains:
             print('No se encontraron dominios accesibles.')
-        for offset in range(0, len(domains), 3):
-            for domain in domains[offset:offset+3]:
-                print('\nLeyendo ' + domain + '…', flush=True)
-                show(domain, args.day, analyze(root, domain, args.day, args.zone, args), bool(args.domain))
-            if offset + 3 >= len(domains) or args.once or not sys.stdin.isatty():
+            return 0
+        print('\nLeyendo historial Fail2Ban una sola vez…', flush=True)
+        args.bans = read_fail2ban(args)
+        show_fail2ban(args.bans, args.day)
+        if args.domain:
+            print('\nLeyendo ' + args.domain + '…', flush=True)
+            show(args.domain, args.day, analyze(root, args.domain, args.day, args.zone, args), True)
+            return 0
+        rows = collect_ranked(root, domains, args.day, args.zone, args)
+        for offset in range(0, len(rows), PAGE_SIZE):
+            for position, (domain, summary) in enumerate(rows[offset:offset+PAGE_SIZE], offset+1):
+                print(f'\nPuesto {position}')
+                show(domain, args.day, summary)
+            if offset + PAGE_SIZE >= len(rows) or args.once or not sys.stdin.isatty():
                 break
-            if input('\nEnter: siguientes 3 | q + Enter: salir > ').strip().lower() in ('q', 'salir'):
+            if input(f'\nEnter: siguientes {PAGE_SIZE} | q + Enter: salir > ').strip().lower() in ('q', 'salir'):
                 break
     finally:
         os.close(root)

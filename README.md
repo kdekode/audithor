@@ -40,13 +40,17 @@ El diagnóstico también acepta `--gentle`. Sin esta opción se aplica una pausa
 
 ## Uso
 
-Hoy, tres dominios por tanda:
+Hoy, cinco dominios por tanda, con bloques separados y métricas en columnas:
 
 ```sh
 /usr/bin/python3 -I -B /too-custom/audithor/audithor.py
 ```
 
-Enter muestra los tres siguientes. `q` seguido de Enter termina; Ctrl+C detiene la lectura. Solo analiza una tanda al conectar su salida a una tubería o ejecutarlo sin terminal. Ordena por última modificación de sus logs de acceso, con desempate alfabético: **no por fecha de alta del dominio**, que no se consulta.
+Primero lee todos los dominios secuencialmente y conserva únicamente un resumen pequeño por dominio. Después muestra el ranking **de más a menos peticiones observadas en la fecha elegida**, desempatando por bytes y nombre. No es un ranking de CPU/RAM. Los presupuestos, históricos ausentes o formatos no interpretados pueden alterar el orden respecto al tráfico real completo.
+
+Enter muestra los cinco siguientes del ranking ya calculado, sin releer sus logs. `q` seguido de Enter termina; Ctrl+C detiene la lectura. Si conecta su salida a una tubería o se ejecuta sin terminal, muestra solo la primera tanda, pero debe analizar todos antes para ordenarlos. Los dominios sin datos de lectura aparecen al final con tráfico N/D; no se interpretan como tráfico cero. Si sube la carga durante el recorrido, detiene la lectura e indica cuántos dominios quedaron pendientes fuera del ranking.
+
+El inventario se recorre inicialmente por modificación de logs para preparar las lecturas; ese orden no determina el ranking final. La espera inicial puede ser de hasta el presupuesto por dominio multiplicado por el número de dominios. No se mantienen tablas de URLs en memoria durante la vista global.
 
 Ayer / fecha histórica / dominio concreto:
 
@@ -63,7 +67,7 @@ Para dedicar hasta media hora a un dominio, conservando lectura secuencial y mem
 ionice -c 3 /usr/bin/python3 -I -B /too-custom/audithor/audithor.py ejemplo.com --seconds 1800 --max-mib 1024 --gzip
 ```
 
-Máximos por dominio: 1–1800 segundos y 1–1024 MiB **descomprimidos**. Por defecto: 30 segundos y 64 MiB. Leerá como máximo unas 1000 líneas/s gracias a una pausa por línea; puede tardar bastante con muchos logs. No reanuda una lectura previa: al repetir el comando empieza de nuevo. Aumenta el presupuesto si el resultado es parcial. `--once` limita la salida a los primeros tres dominios sin interacción.
+Máximos por dominio: 1–1800 segundos y 1–1024 MiB **descomprimidos**. Por defecto: 30 segundos y 64 MiB. Leerá como máximo unas 1000 líneas/s gracias a una pausa por línea; puede tardar bastante con muchos logs. No reanuda una lectura previa: al repetir el comando empieza de nuevo. Aumenta el presupuesto si el resultado es parcial. `--once` muestra solo los primeros cinco puestos sin interacción, pero la vista global necesita analizar todos los dominios antes de ordenar. Para una prueba acotada a dos segundos en total, indica un dominio concreto y `--no-fail2ban`; en la vista global el límite se aplica a cada dominio y el historial Fail2Ban tiene su propio presupuesto.
 
 ## Qué significa cada dato
 
@@ -73,8 +77,8 @@ Máximos por dominio: 1–1800 segundos y 1–1024 MiB **descomprimidos**. Por d
 | Bots/automatización probable | Clasificación heurística del User-Agent, que se puede falsificar. |
 | Humano probable | Agentes de navegadores habituales sin indicadores básicos de acceso sensible. No acredita humanidad. |
 | Desconocido | Resto; las tres clases suman aproximadamente 100%, salvo redondeo. |
-| IP bloqueadas del día por dominio | **N/D**. Un 403 no acredita un bloqueo del firewall. Los bloqueos globales de Fail2Ban no se pueden asignar de forma fiable a un dominio solo con access logs. |
-| RAM y CPU del día por dominio | **N/D**. No están en los access logs; no se reconstruyen para hoy o ayer sin registros previos de procesos/pools/cgroups. Ni los bytes ni las peticiones son una medida de CPU. |
+| IP coincidentes F2B | Número de IP vistas en accesos de esa web y con un evento `Ban` de Fail2Ban ese mismo día. No atribuye el motivo del bloqueo al dominio, ni indica si siguen bloqueadas. `N/D` si no hay datos de lectura de alguno de los dos historiales. |
+| RAM y CPU por dominio | Se han retirado del informe. No están en los access logs; no se reconstruyen para ayer ni para un total histórico sin registros previos de procesos/pools/cgroups. Ni los bytes ni las peticiones son una medida de CPU. |
 | URLs con más consumo | Se muestra transferencia en bytes y número de peticiones, sin atribuirles CPU/RAM. |
 | Errores | HTTP 4xx/5xx por ruta, más categorías de mensajes internos de nginx/Apache/PHP cuando hay presupuesto y formato reconocible. Nunca se imprimen mensajes internos completos. |
 
@@ -86,9 +90,26 @@ Zona por defecto `Europe/Madrid`, modificable con `--timezone`. Los access logs 
 
 Se informa de peticiones **observadas**, fechas encontradas y límites alcanzados. Si no aparecen registros para la fecha, no puede distinguir automáticamente entre ausencia de tráfico, datos eliminados, permisos insuficientes o lectura incompleta. No declara que un día esté completo solo porque haya terminado de leer archivos.
 
-Los `.gz` requieren `--gzip`. Selecciona una sola capa: nginx `proxy_access_log` / `proxy_access_ssl_log`, o Apache si no existen logs nginx. Incluye variantes `.processed`, `.N`, `.processed.N` y `.gz`. Evita sumar dos veces un mismo inode/hardlink. Copias distintas que contengan eventos repetidos pueden producir duplicados; una rotación concurrente también puede omitir o repetir eventos. No deduplica por contenido porque dos peticiones legítimas pueden ser idénticas.
+Para hoy, los `.gz` requieren `--gzip`. Para `--yesterday` o una fecha anterior, se incluyen automáticamente y se priorizan archivos rotados sobre los activos. Esto no recupera logs borrados y sigue sujeto a tiempo/bytes. Selecciona una sola capa: nginx `proxy_access_log` / `proxy_access_ssl_log`, o Apache si no existen logs nginx. Incluye variantes `.processed`, `.N`, `.processed.N` y `.gz`. Evita sumar dos veces un mismo inode/hardlink. Copias distintas que contengan eventos repetidos pueden producir duplicados; una rotación concurrente también puede omitir o repetir eventos. No deduplica por contenido porque dos peticiones legítimas pueden ser idénticas.
 
 Los rankings mantienen hasta 2000 rutas distintas y agrupan las posteriores en `[otras rutas: límite de memoria]`. Por tanto, con alta cardinalidad el top es de las rutas conservadas y su grupo de desbordamiento, no un ranking exacto de todas las URLs.
+
+## Fail2Ban y señales de tráfico sospechoso
+
+Lee `/var/log/fail2ban.log` y sus variantes `.N` / `.gz` **una sola vez por ejecución**, sin ejecutar `fail2ban-client`, abrir su socket, modificar jails o bloquear/desbloquear direcciones. Usa `--fail2ban-log /ruta/al/archivo` si está en otra ubicación, o `--no-fail2ban` para omitirlo. Si el servicio envía solo a journald/syslog y no hay archivo compatible, muestra N/D; no cambia el destino del log ni consulta el journal automáticamente.
+
+El presupuesto de esta lectura es el menor de `--seconds` y 30 segundos, y el menor de `--max-mib` y 16 MiB. Conserva como máximo 20 000 IP únicas y 100 jails más un grupo de otras. Aplica las mismas pausas, guardas y límites de línea. Los contadores son eventos Ban e IP **observados**; cobertura incompleta, logs duplicados o retención pueden alterar los totales. No cuenta `Unban`, `Restore Ban` ni mensajes `Found`. No verifica que el firewall aplicase correctamente el bloqueo y no enumera bloqueos activos anteriores a la fecha.
+
+Los registros Fail2Ban sin offset se filtran por su fecha local escrita: se presupone la misma zona que has elegido para analizar accesos. Si la zona del servidor difiere, la coincidencia diaria cerca de medianoche puede ser inexacta. Una IP bloqueada en SSH puede aparecer también visitando una web; la columna de coincidencias no afirma que esa web generara el bloqueo.
+
+Cada dominio muestra 4xx/5xx, accesos a rutas sensibles y pico observado de peticiones por minuto. Marca **REVISAR** si encuentra cualquiera de estos umbrales orientativos:
+
+- Al menos 20 accesos a rutas sensibles, incluyendo usos legítimos como login.
+- Al menos 100 peticiones observadas con 50% o más de respuestas 4xx.
+- Al menos 20 peticiones observadas con 10% o más de respuestas 5xx.
+- Al menos 300 peticiones observadas en un minuto.
+
+No confirma ataques ni calcula una probabilidad. Un bot legítimo puede tener mucho tráfico; 4xx/5xx pueden tener causas normales o fallos de la aplicación. Los límites de lectura pueden ocultar picos. Los minutos repetidos por cambio horario se distinguen por offset. Al consultar un dominio, añade las diez IP con más peticiones y las rutas sensibles más consultadas. Conserva como máximo 2000 IP y agrupa las restantes; no hace resolución DNS ni confía en cabeceras X-Forwarded-For. Una dirección registrada puede pertenecer a CDN/proxy. **No bloquees una IP solo por este informe.**
 
 ## Límites operativos
 
@@ -104,7 +125,7 @@ Los rankings mantienen hasta 2000 rutas distintas y agrupan las posteriores en `
 
 ## Verificación realizada
 
-En Windows/Python 3.14: compilación y pruebas unitarias de clasificación, cambios de día por offset, fechas inválidas, redacción, cardinalidad, selección de capa, gzip, presupuestos, duplicados por inode y guardas de carga. La prueba de enlaces/FIFO requiere Linux y se omite en Windows. No se ha ejecutado aún contra tu servidor ni se ha validado el recorrido real de descriptores en Linux en este entorno. No garantiza impacto cero en producción.
+En Windows/Python 3.14: clasificación, cambios de día por offset, fechas inválidas, redacción, cardinalidad, selección de capa, gzip, presupuestos, duplicados por inode, guardas, ranking, columnas, señales y parser Fail2Ban. Una prueba de integración con descriptores adaptados verifica lectura histórica gzip, errores internos y coincidencias con Fail2Ban, y comprueba que los archivos de prueba no cambian. La prueba de enlaces/FIFO requiere Linux y se omite en Windows. No se ha ejecutado esta nueva versión contra tu servidor ni se ha validado el recorrido real de descriptores en Linux en este entorno. No garantiza impacto cero en producción.
 
 Pruebas locales:
 
@@ -115,4 +136,4 @@ cd /too-custom/audithor
 
 El test crea únicamente archivos temporales propios y los elimina al finalizar. No necesita leer los logs del servidor. Para una primera lectura real acotada, empieza con un solo dominio y `--seconds 2 --max-mib 1`.
 
-Referencias de formatos y funciones: [logs de Plesk](https://support.plesk.com/hc/en-us/articles/12377744787991-Plesk-for-Linux-services-logs-and-configuration-files), [límites de recursos de Python](https://docs.python.org/3/library/resource.html), [lectura gzip](https://docs.python.org/3/library/gzip.html).
+Referencias de formatos y funciones: [logs de Plesk](https://support.plesk.com/hc/en-us/articles/12377744787991-Plesk-for-Linux-services-logs-and-configuration-files), [límites de recursos de Python](https://docs.python.org/3/library/resource.html), [lectura gzip](https://docs.python.org/3/library/gzip.html), [eventos de acciones de Fail2Ban](https://github.com/fail2ban/fail2ban/blob/master/fail2ban/server/actions.py).

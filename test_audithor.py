@@ -102,6 +102,29 @@ class Tests(unittest.TestCase):
             a.Budget(2, 1, gentle=True).tick(100)
             sleep.assert_called_once_with(.01)
 
+    def test_global_ranking_includes_later_domains_and_discards_routes(self):
+        domains = ['a.com', 'b.com', 'c.com', 'd.com', 'unread.com']
+        def result(root, domain, day, zone, args):
+            totals = {'a.com': 10, 'b.com': 30, 'c.com': 0, 'd.com': 100, 'unread.com': 0}
+            return dict(total=totals[domain], bytes=100, earliest=None, latest=None,
+                        counts=collections.Counter(bot=1), notes=set(),
+                        read=0 if domain == 'unread.com' else 1000,
+                        urls={'should-not-be-retained': 100})
+        args = type('Args', (), {'gentle': True})()
+        with patch.object(a, 'pressure', return_value=None), patch.object(a, 'analyze', side_effect=result) as analyze, contextlib.redirect_stdout(io.StringIO()):
+            rows = a.collect_ranked(0, domains, None, None, args)
+        self.assertEqual([row[0] for row in rows], ['d.com', 'b.com', 'a.com', 'c.com', 'unread.com'])
+        self.assertEqual(analyze.call_count, 5)
+        self.assertTrue(all('urls' not in summary for _, summary in rows))
+
+    def test_global_ranking_stops_when_host_pressure_rises(self):
+        args = type('Args', (), {'gentle': True})()
+        output = io.StringIO()
+        with patch.object(a, 'pressure', return_value='Host ocupado'), patch.object(a, 'analyze') as analyze, contextlib.redirect_stdout(output):
+            self.assertEqual(a.collect_ranked(0, ['a.com', 'b.com'], None, None, args), [])
+            analyze.assert_not_called()
+        self.assertIn('2 dominios pendientes', output.getvalue())
+
     def test_internal_errors_no_raw_secrets(self):
         event = a.error_event(b'2026/10/19 12:30:00 [error] PHP Fatal error: password=secret')
         self.assertEqual(event, (dt.date(2026, 10, 19), 'PHP fatal'))
@@ -113,6 +136,76 @@ class Tests(unittest.TestCase):
         for domain in ['../../etc', 'https://example.com', 'example.com;id', '-x.com', 'a..com']:
             self.assertIsNone(a.DOMAIN.fullmatch(domain))
         self.assertIsNotNone(a.DOMAIN.fullmatch('sub.example.com'))
+
+    def test_fail2ban_only_new_ban_events(self):
+        prefix = b'2026-10-18 12:00:00,123 fail2ban.actions [123]: NOTICE [plesk-apache] '
+        self.assertEqual(a.parse_ban(prefix + b'Ban 192.0.2.1\n'),
+                         (dt.date(2026, 10, 18), 'plesk-apache', '192.0.2.1'))
+        self.assertEqual(a.parse_ban(prefix + b'Ban 2001:db8::1\n')[2], '2001:db8::1')
+        self.assertIsNone(a.parse_ban(prefix + b'Unban 192.0.2.1'))
+        self.assertIsNone(a.parse_ban(prefix + b'Restore Ban 192.0.2.1'))
+        self.assertIsNone(a.parse_ban(prefix + b'Ban not-an-ip'))
+
+    def test_yesterday_includes_gzip_without_extra_flag(self):
+        with patch.object(a, 'ZoneInfo', return_value=dt.timezone.utc):
+            args = a.arguments(['example.com', '--yesterday', '--timezone', 'UTC'])
+            self.assertTrue(args.historical)
+            self.assertTrue(args.gzip)
+            self.assertEqual(args.day, dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1))
+
+    def test_signals_are_separate_from_bot_percentage(self):
+        self.assertEqual(a.signals(dict(total=1000, counts={'bot': 1000})), [])
+        findings = a.signals(dict(total=1000, http4=600, http5=150, sensitive=30, peak=400))
+        self.assertEqual(len(findings), 4)
+
+    def test_card_layout_has_no_unavailable_cpu_ram(self):
+        result = dict(total=100, bytes=12345, counts=collections.Counter(bot=20, probable=80),
+                      earliest=None, latest=None, notes=set(), read=1000,
+                      http4=25, http5=2, sensitive=3, peak=50, f2b_matches=2)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            a.show('example.com', dt.date(2026, 10, 18), result)
+        text = output.getvalue()
+        self.assertIn('TRÁFICO', text)
+        self.assertIn('HTTP 4xx', text)
+        self.assertIn('IP coincidentes F2B', text)
+        self.assertNotIn('RAM diaria', text)
+        self.assertNotIn('CPU diaria', text)
+        self.assertLessEqual(max(map(len, text.splitlines())), 90)
+        self.assertEqual(a.PAGE_SIZE, 5)
+
+    def test_history_analysis_and_fail2ban_read_only_fixtures(self):
+        # Adaptar openat en Windows para probar el recorrido de datos completo.
+        # La prueba Linux separada verifica enlaces/FIFO con descriptores reales.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'proxy_access_log').write_bytes(line())
+            (root / 'proxy_access_log.processed.1.gz').write_bytes(gzip.compress(
+                line('/.env', ua='curl/8', stamp='18/Oct/2026:12:00:00 +0000', status=404) * 30))
+            (root / 'error_log').write_bytes(b'2026/10/18 12:00:00 [error] PHP Fatal error: secret\n')
+            (root / 'fail2ban.log').write_bytes(b'2026-10-18 12:00:00,123 fail2ban.actions [1]: NOTICE [apache] Ban 192.0.2.1\n')
+            before = {p.name: p.read_bytes() for p in root.iterdir()}
+            original_stat = os.stat
+            @contextlib.contextmanager
+            def opening(parent, name):
+                with (root / name).open('rb') as stream:
+                    yield stream
+            def metadata(path, **kwargs):
+                return original_stat(root / path)
+            args = type('Args', (), dict(seconds=10, max_mib=1, gentle=True,
+                day=dt.date(2026, 10, 18), historical=True, gzip=True, domain='example.com',
+                no_fail2ban=False, fail2ban_log='/var/log/fail2ban.log'))()
+            with patch.object(a, 'directory', return_value=999), patch.object(a, 'regular', opening), patch.object(a, 'names', return_value=list(before)), patch.object(a.os, 'stat', side_effect=metadata), patch.object(a.os, 'close'), patch.object(a, 'pressure', return_value=None), patch.object(a.time, 'sleep'):
+                args.bans = a.read_fail2ban(args)
+                result = a.analyze(0, 'example.com', args.day, dt.timezone.utc, args)
+            self.assertEqual(args.bans['events'], 1)
+            self.assertEqual(result['total'], 30)
+            self.assertEqual(result['http4'], 30)
+            self.assertEqual(result['sensitive'], 30)
+            self.assertEqual(result['peak'], 30)
+            self.assertEqual(result['f2b_matches'], 1)
+            self.assertEqual(result['internal']['PHP fatal'], 1)
+            self.assertEqual({p.name: p.read_bytes() for p in root.iterdir()}, before)
 
     @unittest.skipUnless(hasattr(os, 'O_NOFOLLOW'), 'Requiere Linux/openat')
     def test_linux_links_fifo_and_no_mutation(self):
