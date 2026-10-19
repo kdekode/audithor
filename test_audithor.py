@@ -444,6 +444,32 @@ class Tests(unittest.TestCase):
             self.assertNotIn('hidden', text)
             self.assertEqual({p.name: p.read_bytes() for p in root.iterdir()}, before)
 
+    def test_non_daily_rotation_finds_yesterday_near_end_of_processed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for base in ('access_log', 'access_ssl_log'):
+                (root / base).write_bytes(line(stamp='19/Oct/2026:12:00:00 +0000') * 10)
+                (root / (base + '.processed')).write_bytes(
+                    line('/old', stamp='08/Sep/2026:12:00:00 +0000') * 20000 +
+                    line('/target', stamp='18/Oct/2026:12:00:00 +0000') * 100 +
+                    line('/today', stamp='19/Oct/2026:12:00:00 +0000') * 10)
+                (root / (base + '.processed.1.gz')).write_bytes(gzip.compress(
+                    line('/may', stamp='28/May/2026:12:00:00 +0000') * 100))
+            original_stat = os.stat
+            @contextlib.contextmanager
+            def opening(parent, name):
+                with (root / name).open('rb') as stream:
+                    yield stream
+            args = type('Args', (), dict(domain=None, seconds=10, max_mib=.25,
+                gentle=False, sample=True, historical=True, gzip=True, bans=None, day_offset=1))()
+            with patch.object(a, 'directory', return_value=999), patch.object(a, 'regular', opening), patch.object(a, 'names', return_value=[p.name for p in root.iterdir()]), patch.object(a.os, 'stat', side_effect=lambda path, **kwargs: original_stat(root / path)), patch.object(a.os, 'close'), patch.object(a, 'pressure', return_value=None), patch.object(a.time, 'sleep'):
+                result = a.analyze(0, 'example.com', dt.date(2026, 10, 18), dt.timezone.utc, args)
+            self.assertEqual(set(result['selected_files']), {'access_log.processed', 'access_ssl_log.processed'})
+            self.assertEqual(result['total'], 200)
+            self.assertEqual(result['bytes'], 200 * 123)
+            self.assertLessEqual(result['read'], .25 * 1024 * 1024)
+            self.assertTrue(any('orden cronológico' in note for note in result['notes']))
+
     def test_wait_resumes_without_raising_load_limit(self):
         with patch.object(a, 'pressure', side_effect=['Host ocupado', 'Host ocupado', None]), patch.object(a.time, 'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()):
             a.wait_for_capacity(True)

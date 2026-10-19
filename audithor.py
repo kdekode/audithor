@@ -28,7 +28,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 5
-VERSION = '0.8.2'
+VERSION = '0.8.3'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -198,6 +198,8 @@ class Budget:
         self.window_bytes = self.maximum
         self.rapid = rapid
         self.tail = False
+        self.seek_day = None
+        self.zone = None
         self.started = time.monotonic()
         self.cpu_mark = time.process_time()
         self.wall_mark = self.started
@@ -272,6 +274,37 @@ def pressure(gentle=False, rapid=False):
         return 'No se pudo comprobar la presión del host; análisis aplazado. Usa --diagnose.'
 
 
+def seek_near_day(raw, size, day, zone, budget, state):
+    """Búsqueda aproximada solo en texto; supone fechas cronológicas, siempre muestra."""
+    low, high = 0, size
+    for _ in range(14):
+        if high - low <= 16384 or budget.exhausted():
+            break
+        middle = (low + high) // 2
+        raw.seek(middle)
+        chunk = raw.read(min(4096, size - middle, budget.maximum - budget.read))
+        budget.tick(len(chunk))
+        dates, _ = probe_chunk(chunk.split(b'\n', 1)[-1], zone)
+        if not dates or any(a > b for a, b in zip(dates, dates[1:])):
+            state['notes'].add('No se pudo localizar la fecha con búsqueda rápida; lectura desde el inicio.')
+            raw.seek(0)
+            return
+        if dates[0] < day:
+            low = middle
+        else:
+            high = middle
+    position = max(0, low - 16384)
+    raw.seek(position)
+    if position:
+        # Alinear sin interpretar un fragmento como una petición.
+        while not budget.exhausted():
+            fragment = raw.readline(min(16384, budget.maximum - budget.read))
+            budget.tick(len(fragment))
+            if not fragment or fragment.endswith(b'\n'):
+                break
+    state['notes'].add('Búsqueda rápida por fecha: supone orden cronológico y puede omitir entradas fuera de orden.')
+
+
 def scan(parent, name, budget, state):
     with regular(parent, name) as raw:
         initial = os.fstat(raw.fileno())
@@ -280,7 +313,9 @@ def scan(parent, name, budget, state):
             return
         state['inodes'].add(key)
         packed = name.endswith('.gz')
-        if budget.tail and not packed and initial.st_size > budget.maximum - budget.read:
+        if budget.seek_day is not None and not packed:
+            seek_near_day(raw, initial.st_size, budget.seek_day, budget.zone, budget, state)
+        elif budget.tail and not packed and initial.st_size > budget.maximum - budget.read:
             raw.seek(max(0, initial.st_size - (budget.maximum - budget.read)))
             # Descartar la primera línea cortada dentro del mismo presupuesto.
             while not budget.exhausted():
@@ -403,7 +438,7 @@ def probe_chunk(data, zone):
     for line in data.splitlines(keepends=True):
         if not line.endswith(b'\n'):
             continue
-        stamp = re.search(rb'\[([^\]]{20,40})\]', line)
+        stamp = re.match(rb'^\S+ \S+ \S+ \[([^\]]{20,40})\]', line)
         if stamp:
             try:
                 dates.append(parse_stamp(stamp[1], zone).date())
@@ -414,6 +449,71 @@ def probe_chunk(data, zone):
     return dates, combined
 
 
+def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1):
+    """Elegir por fechas de extractos, no por una supuesta rotación diaria."""
+    groups = collections.defaultdict(list)
+    for name in files:
+        match = re.match(r'^(?:proxy_)?access(?:_ssl)?_log', name)
+        if match:
+            groups[match[0]].append(name)
+    deadline = min(budget.end, time.monotonic() + 1)
+    # Reservar la mayor parte del presupuesto para contar tráfico, no inspeccionarlo.
+    probe_limit = min(budget.maximum, budget.read + min(256 * 1024, max(1, (budget.maximum - budget.read) // 8)))
+    selected = set()
+    def dates_in(name):
+        if time.monotonic() >= deadline or budget.read >= probe_limit or budget.exhausted():
+            return []
+        try:
+            with regular(parent, name) as raw:
+                size = os.fstat(raw.fileno()).st_size
+                cap = min(8192, probe_limit - budget.read)
+                if name.endswith('.gz'):
+                    with gzip.GzipFile(fileobj=raw, mode='rb') as stream:
+                        first = stream.read(cap)
+                    last = b''
+                else:
+                    first = raw.read(cap)
+                    budget.tick(len(first))
+                    last = b''
+                    if size > len(first) and budget.read < probe_limit and not budget.exhausted():
+                        raw.seek(max(len(first), size - 8192))
+                        last = raw.read(min(8192, probe_limit - budget.read)).split(b'\n', 1)[-1]
+                    budget.tick(len(last))
+                if name.endswith('.gz'):
+                    budget.tick(len(first))
+            a, _ = probe_chunk(first, zone)
+            b, _ = probe_chunk(last, zone)
+            return a + b
+        except (OSError, EOFError, ValueError, zlib.error):
+            notes.add('No se pudo comprobar la fecha de ' + name)
+            return []
+    for base, group in groups.items():
+        plain = [n for n in group if not n.endswith('.gz')]
+        compatible = []
+        for name in plain:
+            dates = dates_in(name)
+            if dates and min(dates) <= day <= max(dates):
+                compatible.append(name)
+        if compatible:
+            selected.update(compatible)
+            continue
+        # En gzip solo conocemos el inicio: el más reciente anterior al día es candidato.
+        zipped = []
+        for name in (n for n in group if n.endswith('.gz')):
+            dates = dates_in(name)
+            if dates and min(dates) <= day:
+                zipped.append((min(dates), name))
+        if zipped:
+            latest = max(date for date, _ in zipped)
+            selected.update(name for date, name in zipped if date == latest)
+            notes.add('Candidato gzip elegido por fecha inicial; no se ha verificado su fecha final.')
+        else:
+            selected.update(quick_files(group, True, day_offset))
+            notes.add('No se confirmó un archivo para la fecha en los extractos; selección provisional.')
+    notes.add('Selección por fechas de extractos: un intervalo compatible no garantiza registros de todo el día.')
+    return [name for name in files if name in selected]
+
+
 def inspect_logs(root, args):
     """Metadatos y extractos pequeños; no imprime líneas, IP, URL ni User-Agent."""
     fd = directory(args.domain + '/logs', root)
@@ -421,8 +521,10 @@ def inspect_logs(root, args):
         candidates = sorted(n for n in names(fd, 4096) if re.fullmatch(
             r'(?:proxy_)?access(?:_ssl)?_log(?:\.processed)?(?:\.\d+)?(?:\.gz)?', n))
         primary, _, layer = sources(fd, True, args.historical)
-        chosen = set(primary if args.full else quick_files(
-            historical_order(primary, fd, args.historical), args.historical, args.day_offset))
+        probe_notes = set()
+        chosen = set(primary if args.full else dated_quick_files(
+            fd, historical_order(primary, fd, args.historical), args.day, args.zone,
+            Budget(1, 2, rapid=True), probe_notes, args.day_offset))
         print(f'\nINSPECCIÓN DE LOGS · {args.domain} · fecha solicitada {args.day} · {args.timezone}')
         print(f'Fuente que usaría el análisis: {layer.upper()}. * = archivo seleccionado.')
         print('Cada fecha es SOLO del extracto leído; no demuestra la cobertura completa.')
@@ -460,6 +562,8 @@ def inspect_logs(root, args):
             print('Se omitieron archivos: máximo 32 por inspección.')
         print('\nCOMBINED = líneas de muestra que acepta el parser, no peticiones del día.')
         print('Sin fechas/COMBINED 0 puede significar archivo vacío, formato distinto o muestra insuficiente.')
+        for note in sorted(probe_notes):
+            print('Selección: ' + note)
     finally:
         os.close(fd)
 
@@ -582,12 +686,12 @@ def analyze(root, domain, day, zone, args):
         # Más reciente primero: útil para hoy con presupuesto acotado.
         files = historical_order(files, fd, args.historical)
         if not continuous:
-            chosen = quick_files(files, args.historical, getattr(args, 'day_offset', 1))
+            chosen = dated_quick_files(fd, files, day, zone, budget, state['notes'], getattr(args, 'day_offset', 1))
             state['notes'].add('VISTA RÁPIDA: muestra de archivos probables; no es el total del día. Usa --full para ampliar.')
             if len(chosen) < len(files):
                 state['notes'].add(f'Se omiten {len(files) - len(chosen)} archivos de otras rotaciones.')
             files = chosen
-        state['selected_files'] = files[:2] if not continuous else []
+        state['selected_files'] = files if not continuous else []
         total_end, total_maximum = budget.end, budget.maximum
         for index, name in enumerate(files):
             if not continuous:
@@ -601,6 +705,8 @@ def analyze(root, domain, day, zone, args):
                 budget.end = time.monotonic() + max(0, total_end - time.monotonic()) / remaining_files
                 budget.maximum = budget.read + max(1, (total_maximum - budget.read) // remaining_files)
                 budget.tail = not args.historical
+                budget.seek_day = day if args.historical and not name.endswith('.gz') else None
+                budget.zone = zone
             try:
                 for line in scan(fd, name, budget, state):
                     event = parse(line, zone)
@@ -836,7 +942,8 @@ def show_overview_row(domain, result):
         flags.append(activity_level(result.get('peak', 0)))
     if result.get('rapid'):
         flags.append('M')
-    ordinary = ('VISTA RÁPIDA:', 'Se omiten ', 'Vista rápida: cola', 'Límite de tiempo/bytes', 'Quedan archivos sin leer')
+    ordinary = ('VISTA RÁPIDA:', 'Se omiten ', 'Vista rápida: cola', 'Límite de tiempo/bytes', 'Quedan archivos sin leer',
+                'Selección por fechas de extractos:', 'Búsqueda rápida por fecha:', 'Candidato gzip elegido por fecha inicial;')
     if any(not note.startswith(ordinary) for note in result['notes']):
         flags.append('A')
     print(overview_line((domain, f'{total:,}' if known and total else 'N/D',

@@ -1,4 +1,4 @@
-# Audithor 0.8.2
+# Audithor 0.8.3
 
 Creado por **steev anderson**. Inspección local de logs Linux/Plesk, en consola y sin dependencias de Python externas. Requiere Python 3.9+ y zonas horarias del sistema. No usa idxo-security ni su instalador.
 
@@ -8,14 +8,18 @@ Las versiones anteriores recorrían todas las rotaciones y dormían 10 ms por l�
 
 - Elimina por completo el correo, `--send` y la ejecución de comandos externos.
 - Usa por defecto una **muestra de hasta 5 segundos y 8 MiB descomprimidos por dominio** para accesos.
-- Selecciona un archivo por familia HTTP/HTTPS, en lugar de toda la retención.
+- Selecciona archivos compatibles por familia HTTP/HTTPS, en lugar de toda la retención.
 - Para hoy, lee una cola reciente del log activo cuando no cabe en el presupuesto.
-- Para ayer, prefiere la rotación `.1` de HTTP y HTTPS; para otras fechas, la rotación numérica más próxima a la antigüedad en días. **Es una heurística**, no una prueba de qué fecha contiene el archivo. Si no hay rotaciones numeradas, usa el activo o un candidato disponible. Siempre filtra cada línea por la fecha real.
+- Comprueba fechas de extractos antes de elegir: prefiere archivos sin comprimir (`.processed` o activos) cuyo intervalo observado sea compatible con el día. No supone que `.1.gz` sea ayer: la rotación puede ser por tamaño y contener meses. Si no hay texto compatible, examina inicios gzip y prefiere la fecha inicial más reciente anterior o igual al día. Si no puede confirmar un candidato, conserva una selección provisional y avisa. Siempre filtra cada línea por su fecha real.
 - Reparte el tiempo/bytes restantes entre HTTP y HTTPS para que el primero no agote todo el presupuesto.
 - Regula CPU y lectura por bloques de 128 líneas/fragmentos, en lugar de dormir en cada línea.
 - En vista rápida, la carga alta reduce el ritmo propio; **no activa la espera indefinida**. Si no se puede comprobar el estado o quedan menos de 256 MiB disponibles, se aplaza la lectura.
 
 La vista rápida siempre se presenta como **muestra**, nunca como total diario. Puede omitir IP, rutas, picos o errores que no estén en los archivos/fragmentos leídos. Los porcentajes y el orden del resumen describen esa muestra. Si no hay accesos de la fecha, no demuestra ausencia de tráfico. El informe muestra fuente, archivos seleccionados, fechas encontradas y avisos.
+
+La selección de accesos dedica como máximo un segundo cooperativo, 256 KiB y un octavo de los bytes restantes a extractos de hasta 8 KiB del inicio/final en texto, o solo inicio en gzip. Ese tiempo/lectura se descuentan del presupuesto del dominio. Una coincidencia de intervalo en muestras no garantiza que todas las fechas intermedias estén presentes. Si varios archivos de texto son compatibles, puede seleccionar más de uno por familia y reparte el presupuesto entre ellos; no mezcla Apache y nginx.
+
+Para fechas pasadas en texto sin comprimir, realiza una búsqueda aproximada hacia el día: como máximo 14 lecturas de hasta 4 KiB, contadas en su presupuesto, con un margen previo de 16 KiB. Después alinea la línea y cuenta únicamente registros del día. **Supone orden cronológico**; puede omitir registros tardíos o fuera de orden y por eso sigue siendo muestra. Si no puede encontrar fechas coherentes en las sondas, avisa y lee desde el inicio. No aplica esta búsqueda a gzip, porque descomprimir hasta una posición no sería un acceso aleatorio barato.
 
 ## Preparación y uso
 
@@ -132,11 +136,11 @@ Para investigar SIN FECHA sin recorrer todos los históricos:
 python3 -I -B audithor.py ejemplo.com --yesterday --inspect-logs
 ```
 
-Requiere un dominio y no genera informes ni lee Fail2Ban. Muestra ambas capas de accesos disponibles, marca los archivos que seleccionaría el análisis y obtiene fechas de extractos pequeños: inicio de hasta 16 KiB por archivo y, para texto sin comprimir, hasta 16 KiB adicionales del final. No lee el final de gzip, porque requeriría recorrerlo. Máximo 32 archivos y 3 segundos cooperativos entre archivos, aparte de inventario/metadatos; una lectura de disco bloqueada puede tardar más. No imprime IP, rutas, agentes ni líneas originales. COMBINED indica cuántas líneas de los extractos acepta el parser, no solicitudes del día. Una fecha encontrada en un extracto no prueba la cobertura del archivo completo. Esta información ayuda a distinguir selección errónea, datos de otras fechas, archivos vacíos y formato no reconocido antes de cambiar el selector.
+Requiere un dominio y no genera informes ni lee Fail2Ban. Muestra ambas capas de accesos disponibles, marca los archivos que seleccionaría el análisis y obtiene fechas de extractos pequeños: inicio de hasta 16 KiB por archivo y, para texto sin comprimir, hasta 16 KiB adicionales del final. No lee el final de gzip, porque requeriría recorrerlo. Máximo 32 archivos y 3 segundos cooperativos entre archivos, más hasta un segundo/256 KiB para preselección y el inventario/metadatos. Una lectura bloqueada puede tardar más. No imprime IP, rutas, agentes ni líneas originales. COMBINED indica cuántas líneas de los extractos acepta el parser, no solicitudes del día. Una fecha encontrada en un extracto no prueba la cobertura del archivo completo. La selección del diagnóstico también puede quedar provisional si agota sus sondas.
 
 ## Verificación
 
-Pruebas locales en Windows/Python 3.14 para selección histórica Apache/nginx, archivos rápidos HTTP/HTTPS, cola reciente, límites, fechas, parser, filtros, cardinalidad, señales, espera explícita de `--full`, continuidad gzip, tandas con `start`, filas alineadas emitidas antes del siguiente dominio y HTML escapado/acotado. Las pruebas de descriptores/enlaces/permisos reales requieren Linux y se omiten en este entorno. No se ha validado esta nueva revisión en tu servidor.
+Pruebas locales en Windows/Python 3.14 para selección histórica Apache/nginx, archivos rápidos HTTP/HTTPS, cola reciente, límites, fechas, parser, filtros, cardinalidad, señales, espera explícita de `--full`, continuidad gzip, tandas con `start`, filas alineadas y HTML escapado/acotado. Una regresión reproduce `.1.gz` de mayo y `.processed` con 20 000 accesos antiguos, 100 del día objetivo y 10 de hoy por familia: selecciona ambos `.processed`, recupera exactamente los 200 accesos de la fecha y permanece dentro de 256 KiB de lectura. Las pruebas de descriptores/enlaces/permisos reales requieren Linux y se omiten aquí. No se ha validado esta revisión en tu servidor.
 
 Fixture local de 12 000 accesos (1 356 000 bytes), con lector de archivos adaptado a Windows y sin medir presión real del host: **8,289 s transcurridos y 0,812 s CPU**. Es una medida de esa prueba, no una promesa de velocidad/RAM en producción. Verifica el comportamiento de regulación sin la antigua pausa fija por línea.
 
