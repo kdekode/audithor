@@ -28,7 +28,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 5
-VERSION = '0.8.1'
+VERSION = '0.8.2'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -52,21 +52,25 @@ def safe_path(raw):
     return clean(path, 180)
 
 
+def parse_stamp(raw, zone):
+    match = STAMP.fullmatch(raw.decode('ascii'))
+    if not match:
+        raise ValueError('Fecha de log no reconocida.')
+    d, mon, y, h, minute, sec, sign, oh, om = match.groups()
+    if int(oh) > 23 or int(om) > 59:
+        raise ValueError('Offset no válido.')
+    delta = dt.timedelta(hours=int(oh), minutes=int(om)) * (1 if sign == '+' else -1)
+    return dt.datetime(int(y), MONTHS[mon], int(d), int(h), int(minute), int(sec),
+                       tzinfo=dt.timezone(delta)).astimezone(zone)
+
+
 def parse(line, zone):
     m = ACCESS.match(line)
     if not m:
         return None
     try:
         ipaddress.ip_address(m[1].decode('ascii'))
-        t = STAMP.fullmatch(m[2].decode('ascii'))
-        if not t:
-            return None
-        d, mon, y, h, minute, sec, sign, oh, om = t.groups()
-        if int(oh) > 23 or int(om) > 59:
-            return None
-        delta = dt.timedelta(hours=int(oh), minutes=int(om)) * (1 if sign == '+' else -1)
-        stamp = dt.datetime(int(y), MONTHS[mon], int(d), int(h), int(minute), int(sec),
-                            tzinfo=dt.timezone(delta)).astimezone(zone)
+        stamp = parse_stamp(m[2], zone)
         path = safe_path(m[4].decode('utf-8', 'replace'))
         ua = m[7].decode('utf-8', 'replace')[:512]
         kind = ('bot' if BOT.search(ua) or AUTO.search(ua) else
@@ -391,6 +395,73 @@ def quick_files(files, historical, day_offset=1, single_base=None):
         else:
             selected.add(group[0])
     return [name for name in files if name in selected]
+
+
+def probe_chunk(data, zone):
+    dates = []
+    combined = 0
+    for line in data.splitlines(keepends=True):
+        if not line.endswith(b'\n'):
+            continue
+        stamp = re.search(rb'\[([^\]]{20,40})\]', line)
+        if stamp:
+            try:
+                dates.append(parse_stamp(stamp[1], zone).date())
+            except (ValueError, KeyError, UnicodeError, OverflowError):
+                pass
+        if parse(line, zone):
+            combined += 1
+    return dates, combined
+
+
+def inspect_logs(root, args):
+    """Metadatos y extractos pequeños; no imprime líneas, IP, URL ni User-Agent."""
+    fd = directory(args.domain + '/logs', root)
+    try:
+        candidates = sorted(n for n in names(fd, 4096) if re.fullmatch(
+            r'(?:proxy_)?access(?:_ssl)?_log(?:\.processed)?(?:\.\d+)?(?:\.gz)?', n))
+        primary, _, layer = sources(fd, True, args.historical)
+        chosen = set(primary if args.full else quick_files(
+            historical_order(primary, fd, args.historical), args.historical, args.day_offset))
+        print(f'\nINSPECCIÓN DE LOGS · {args.domain} · fecha solicitada {args.day} · {args.timezone}')
+        print(f'Fuente que usaría el análisis: {layer.upper()}. * = archivo seleccionado.')
+        print('Cada fecha es SOLO del extracto leído; no demuestra la cobertura completa.')
+        print('Gzip: inicio de hasta 16 KiB. Texto: inicio y final de hasta 16 KiB cada uno.')
+        print('Fechas convertidas a la zona elegida. No se muestran IP, rutas ni agentes.\n')
+        deadline = time.monotonic() + 3
+        rows = []
+        for name in candidates[:32]:
+            if time.monotonic() > deadline:
+                print('Inspección parcial: límite de 3 segundos alcanzado.')
+                break
+            try:
+                with regular(fd, name) as raw:
+                    size = os.fstat(raw.fileno()).st_size
+                    if name.endswith('.gz'):
+                        with gzip.GzipFile(fileobj=raw, mode='rb') as zipped:
+                            first = zipped.read(16384)
+                        last = b''
+                    else:
+                        first = raw.read(16384)
+                        last = b''
+                        if size > 16384:
+                            raw.seek(max(16384, size - 16384))
+                            last = raw.read(16384).split(b'\n', 1)[-1]
+                dates, count = probe_chunk(first, args.zone)
+                end_dates, end_count = probe_chunk(last, args.zone)
+                range_text = lambda values: (str(min(values)) + '..' + str(max(values))) if values else 'Sin fechas en muestra'
+                rows.append(('*' if name in chosen else '', name, f'{size/1048576:.2f}',
+                             range_text(dates), range_text(end_dates) if not name.endswith('.gz') else 'No leído (gzip)',
+                             str(count + end_count)))
+            except (OSError, EOFError, ValueError, zlib.error) as exc:
+                rows.append(('*' if name in chosen else '', name, 'N/D', clean(str(exc), 21), '-', '0'))
+        table(('*', 'ARCHIVO', 'MiB', 'FECHAS INICIO', 'FECHAS FINAL', 'COMBINED'), rows, (1, 38, 8, 22, 22, 8))
+        if len(candidates) > 32:
+            print('Se omitieron archivos: máximo 32 por inspección.')
+        print('\nCOMBINED = líneas de muestra que acepta el parser, no peticiones del día.')
+        print('Sin fechas/COMBINED 0 puede significar archivo vacío, formato distinto o muestra insuficiente.')
+    finally:
+        os.close(fd)
 
 
 def read_fail2ban(args):
@@ -768,8 +839,8 @@ def show_overview_row(domain, result):
     ordinary = ('VISTA RÁPIDA:', 'Se omiten ', 'Vista rápida: cola', 'Límite de tiempo/bytes', 'Quedan archivos sin leer')
     if any(not note.startswith(ordinary) for note in result['notes']):
         flags.append('A')
-    print(overview_line((domain, f'{total:,}' if known else 'N/D',
-                         f'{result["bytes"]/1048576:.2f}' if known else 'N/D',
+    print(overview_line((domain, f'{total:,}' if known and total else 'N/D',
+                         f'{result["bytes"]/1048576:.2f}' if known and total else 'N/D',
                          percent('bot'), percent('probable'), percent('unknown'),
                          f'{result.get("http4", 0):,}' if total else 'N/D',
                          f'{result.get("http5", 0):,}' if total else 'N/D',
@@ -1032,12 +1103,15 @@ def arguments(argv=None):
     parser.add_argument('--max-mib', type=int, default=8, help='MiB descomprimidos por dominio; por tanda con --full (1–1024)')
     parser.add_argument('--once', action='store_true', help='Analizar únicamente la primera tanda de cinco dominios')
     parser.add_argument('--diagnose', action='store_true', help='Mostrar carga, CPU lógicas y memoria; sin analizar dominios')
+    parser.add_argument('--inspect-logs', action='store_true', help='Con un dominio, mostrar archivos y fechas de extractos pequeños, sin tráfico privado')
     parser.add_argument('--gentle', action='store_true', help='Reduce los objetivos de CPU y lectura del propio proceso')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--full', action='store_true', help='Recorrer todos los históricos; puede tardar mucho y esperar por carga')
     modes.add_argument('--sample', action='store_true', help='Vista rápida limitada (ya es el modo predeterminado)')
     args = parser.parse_args(argv)
     args.sample = not args.full
+    if args.inspect_logs and not args.domain:
+        parser.error('--inspect-logs requiere indicar un dominio.')
     if args.domain and not DOMAIN.fullmatch(args.domain):
         parser.error('Dominio no válido. Usa su nombre ASCII exacto, sin URL ni rutas.')
     if not 1 <= args.seconds <= 1800 or not 1 <= args.max_mib <= 1024:
@@ -1094,7 +1168,7 @@ def main(argv=None):
         print('Fecha histórica: gzip incluido automáticamente; prioridad a logs rotados.')
     if args.gentle:
         print('Modo suave: objetivos aproximados de CPU/lectura más bajos; regulación por bloques.')
-    if args.sample:
+    if args.sample or args.inspect_logs:
         reason = pressure(args.gentle, rapid=True)
         if reason:
             raise RuntimeError(reason)
@@ -1104,6 +1178,9 @@ def main(argv=None):
     root = directory(args.root)
     args.audit = None
     try:
+        if args.inspect_logs:
+            inspect_logs(root, args)
+            return 0
         domains = [args.domain] if args.domain else discover(root)
         if not domains:
             print('No se encontraron dominios accesibles.')

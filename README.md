@@ -1,4 +1,4 @@
-# Audithor 0.8.1
+# Audithor 0.8.2
 
 Creado por **steev anderson**. Inspección local de logs Linux/Plesk, en consola y sin dependencias de Python externas. Requiere Python 3.9+ y zonas horarias del sistema. No usa idxo-security ni su instalador.
 
@@ -30,6 +30,8 @@ python3 -I -B audithor.py --yesterday
 Sin indicar un dominio, muestra una **tabla con una fila por dominio**, disponible en cuanto termina su lectura. Columnas: DOMINIO, PETICIONES, MiB, BOTS %, HUM. %, DESC. %, 4xx (#), 5xx (#), PICO/MIN y ESTADO. HUM. significa humano probable; DESC. es desconocido, no se suma a humanos. No inventa páginas/usuarios únicos ni considera que todo lo que no parece bot sea humano.
 
 ESTADO usa REV:n para el número de umbrales activados, M para muestra, A para avisos adicionales y SIN FECHA cuando no se observaron accesos de la fecha. Si no se activan umbrales, muestra el volumen orientativo del pico (BAJA/MODERADA/ALTA). Los nombres largos se abrevian solo en la tabla. La tabla requiere una terminal ancha, de unos 126 caracteres; el detalle por dominio conserva el nombre completo, explicaciones, archivos, fechas, rankings y avisos.
+
+Si aparece SIN FECHA, peticiones y MiB se muestran como N/D: no se deduce tráfico cero de una muestra sin datos del día. Que existan archivos `.1.gz` no demuestra que contengan ayer. Las rotaciones pueden no ser diarias y la muestra de un archivo puede empezar en otra fecha.
 
 Al terminar cinco, espera **`start` + Enter** para los siguientes cinco. Enter solo no inicia más trabajo; `q` termina y muestra el resumen de lo analizado. **No ordena antes de analizar**: el resumen final se prepara con los contadores acumulados, sin releer logs. El indicador temporal de lectura se escribe en stderr solo si es terminal, para mantener limpias las filas.
 
@@ -123,6 +125,14 @@ python3 -I -B audithor.py --diagnose
 ```
 
 El diagnóstico no abre logs. En `time -v`, `Maximum resident set size` indica el pico RSS en KiB del proceso. No instales herramientas si faltan solo para ejecutar Audithor. Inventario limitado a 10 000 entradas/15 s, directorios de logs a 4096 entradas y fuentes a 128 archivos. Líneas de 16 KiB; excesivas o incompletas se descartan con aviso. No se leen archivos enteros en memoria.
+
+Para investigar SIN FECHA sin recorrer todos los históricos:
+
+```sh
+python3 -I -B audithor.py ejemplo.com --yesterday --inspect-logs
+```
+
+Requiere un dominio y no genera informes ni lee Fail2Ban. Muestra ambas capas de accesos disponibles, marca los archivos que seleccionaría el análisis y obtiene fechas de extractos pequeños: inicio de hasta 16 KiB por archivo y, para texto sin comprimir, hasta 16 KiB adicionales del final. No lee el final de gzip, porque requeriría recorrerlo. Máximo 32 archivos y 3 segundos cooperativos entre archivos, aparte de inventario/metadatos; una lectura de disco bloqueada puede tardar más. No imprime IP, rutas, agentes ni líneas originales. COMBINED indica cuántas líneas de los extractos acepta el parser, no solicitudes del día. Una fecha encontrada en un extracto no prueba la cobertura del archivo completo. Esta información ayuda a distinguir selección errónea, datos de otras fechas, archivos vacíos y formato no reconocido antes de cambiar el selector.
 
 ## Verificación
 

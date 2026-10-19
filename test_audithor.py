@@ -400,6 +400,50 @@ class Tests(unittest.TestCase):
         self.assertIn('DESC. %', lines[1])
         self.assertNotIn('QUÉ SE HA MEDIDO', output.getvalue())
 
+    def test_no_date_is_unknown_instead_of_zero_traffic(self):
+        result = dict(total=0, bytes=0, read=500, rapid=True,
+                      counts=collections.Counter(), notes=set())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            a.show_overview_row('example.com', result)
+        self.assertEqual(output.getvalue().split()[1:3], ['N/D', 'N/D'])
+        self.assertIn('SIN FECHA', output.getvalue())
+
+    def test_probe_distinguishes_timestamp_from_combined_format(self):
+        dates, combined = a.probe_chunk(line('/private?password=secret'), dt.timezone.utc)
+        self.assertEqual(dates, [dt.date(2026, 10, 19)])
+        self.assertEqual(combined, 1)
+        self.assertNotIn('secret', str((dates, combined)))
+        dates, combined = a.probe_chunk(b'192.0.2.1 - - [18/Oct/2026:12:00:00 +0000] different-format\n', dt.timezone.utc)
+        self.assertEqual(dates, [dt.date(2026, 10, 18)])
+        self.assertEqual(combined, 0)
+
+    def test_inspection_shows_real_dates_without_ip_or_url(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'access_log.processed').write_bytes(line('/secret?password=hidden', stamp='18/Oct/2026:12:00:00 +0000'))
+            (root / 'access_log.processed.1.gz').write_bytes(gzip.compress(line('/private', stamp='17/Oct/2026:12:00:00 +0000')))
+            (root / 'proxy_access_log').write_bytes(b'')
+            before = {p.name: p.read_bytes() for p in root.iterdir()}
+            original_stat = os.stat
+            @contextlib.contextmanager
+            def opening(parent, name):
+                with (root / name).open('rb') as stream:
+                    yield stream
+            args = type('Args', (), dict(domain='example.com', historical=True, full=False,
+                day_offset=1, day=dt.date(2026, 10, 18), zone=dt.timezone.utc, timezone='UTC'))()
+            output = io.StringIO()
+            with patch.object(a, 'directory', return_value=999), patch.object(a, 'regular', opening), patch.object(a, 'names', return_value=list(before)), patch.object(a.os, 'stat', side_effect=lambda path, **kwargs: original_stat(root / path)), patch.object(a.os, 'close'), contextlib.redirect_stdout(output):
+                a.inspect_logs(0, args)
+            text = output.getvalue()
+            self.assertIn('2026-10-18', text)
+            self.assertIn('2026-10-17', text)
+            self.assertIn('APACHE', text)
+            self.assertNotIn('192.0.2.1', text)
+            self.assertNotIn('/secret', text)
+            self.assertNotIn('hidden', text)
+            self.assertEqual({p.name: p.read_bytes() for p in root.iterdir()}, before)
+
     def test_wait_resumes_without_raising_load_limit(self):
         with patch.object(a, 'pressure', side_effect=['Host ocupado', 'Host ocupado', None]), patch.object(a.time, 'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()):
             a.wait_for_capacity(True)
