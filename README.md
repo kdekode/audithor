@@ -1,4 +1,4 @@
-# Audithor 0.9.0
+# Audithor 0.9.1
 
 Creado por **steev anderson**. Inspección local de logs Linux/Plesk, en consola y sin dependencias de Python externas. Requiere Python 3.9+ y zonas horarias del sistema. No usa idxo-security ni su instalador.
 
@@ -122,7 +122,7 @@ Al indicar un dominio o guardar HTML se calculan rankings de URLs, bytes, errore
 
 En vista rápida, los mensajes internos de nginx/Apache/PHP tienen un presupuesto adicional de hasta **2 segundos/2 MiB**, seleccionando un archivo probable de la misma capa. Solo conserva categorías, no mensajes completos. Para un dominio o HTML lee además una muestra de Fail2Ban de hasta **3 segundos/2 MiB**, una sola vez por ejecución, sin cliente ni socket. Así un detalle puede tardar aproximadamente 5+2+3 segundos por defecto, más operaciones de disco y pausas acotadas. La vista global normal no analiza estos historiales adicionales.
 
-Fail2Ban lee `/var/log/fail2ban.log` y una rotación probable; `--fail2ban-log` cambia la ruta y `--no-fail2ban` lo omite. Incluso con `--full`, su lectura mantiene el límite 3 s/2 MiB, aunque admite todas sus rotaciones hasta agotarlo. Conserva hasta 20 000 IP y 100 jails más un grupo de otras. Cuenta eventos `Ban`, sin `Unban`, `Restore Ban` ni `Found`; no confirma aplicación del firewall ni enumera bloqueos activos. Coincidencia por dominio significa que la IP visitó esa web y tuvo evento Ban ese día, no que la web originara el bloqueo.
+Fail2Ban lee `/var/log/fail2ban.log`; `--fail2ban-log` cambia la ruta y `--no-fail2ban` lo omite. La vista rápida elige archivos por fechas de extractos, sin suponer rotación diaria: ayer puede estar en el archivo activo. En texto busca aproximadamente el inicio del período suponiendo orden cronológico; en gzip lee desde el inicio. Las sondas y la búsqueda comparten el límite de 3 s/2 MiB con el conteo. Muestra archivos seleccionados, bytes leídos y fechas de mensajes recorridos para diagnosticar resultados N/D. Sigue siendo una muestra: no garantiza cobertura ni todos los bloqueos. Incluso con `--full`, mantiene el límite 3 s/2 MiB, aunque admite todas sus rotaciones hasta agotarlo. Conserva hasta 20 000 IP y 100 jails más un grupo de otras. Cuenta eventos `Ban`, sin `Unban`, `Restore Ban` ni `Found`; no confirma aplicación del firewall ni enumera bloqueos activos. Coincidencia por dominio significa que la IP visitó esa web y tuvo evento Ban ese día, no que la web originara el bloqueo.
 
 Los access logs con offset se convierten a `Europe/Madrid` o `--timezone`. Los errores internos y Fail2Ban sin offset se filtran por su fecha local escrita: se presupone la zona elegida. Si no coincide con la del servidor, los cruces cerca de medianoche pueden ser imprecisos. Si Fail2Ban solo escribe en journal/syslog, muestra N/D y no cambia su configuración.
 

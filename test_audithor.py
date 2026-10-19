@@ -574,6 +574,33 @@ class Tests(unittest.TestCase):
             self.assertEqual(budget.read, len(line()) * 20)
             self.assertFalse(state['notes'])
 
+    def test_fail2ban_yesterday_in_active_log_not_daily_rotation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            def message(day, action='Found', component='filter'):
+                return (f'2026-10-{day} 11:43:45,145 fail2ban.{component}        '
+                        f'[662096]: NOTICE  [plesk-modsecurity] {action} 192.0.2.1\n').encode()
+            (root / 'fail2ban.log').write_bytes(message('17') * 28000 +
+                message('18', 'Ban', 'actions') * 5 + message('19'))
+            (root / 'fail2ban.log.1.gz').write_bytes(gzip.compress(message('12', 'Ban', 'actions')))
+            before = {p.name: p.read_bytes() for p in root.iterdir()}
+            @contextlib.contextmanager
+            def opening(parent, name):
+                with (root / name).open('rb') as stream:
+                    yield stream
+            args = type('Args', (), dict(seconds=3, max_mib=2, gentle=False,
+                day=dt.date(2026, 10, 18), historical=True, gzip=True,
+                no_fail2ban=False, fail2ban_log='/var/log/fail2ban.log'))()
+            original_stat = os.stat
+            with patch.object(a, 'directory', return_value=999), patch.object(a, 'regular', opening), patch.object(a, 'names', return_value=list(before)), patch.object(a.os, 'stat', side_effect=lambda path, **kw: original_stat(root / path)), patch.object(a.os, 'close'), patch.object(a, 'pressure', return_value=None), patch.object(a.time, 'sleep'):
+                result = a.read_fail2ban(args)
+            self.assertEqual(result['selected_files'], ['fail2ban.log'])
+            self.assertEqual(result['events'], 5)
+            self.assertTrue(result['day_seen'])
+            self.assertEqual(result['jails']['plesk-modsecurity'], 5)
+            self.assertLessEqual(result['read'], 2 * 1048576)
+            self.assertEqual({p.name: p.read_bytes() for p in root.iterdir()}, before)
+
     def test_history_analysis_and_fail2ban_read_only_fixtures(self):
         # Adaptar openat en Windows para probar el recorrido de datos completo.
         # La prueba Linux separada verifica enlaces/FIFO con descriptores reales.

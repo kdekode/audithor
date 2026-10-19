@@ -28,7 +28,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.9.0'
+VERSION = '0.9.1'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -284,7 +284,8 @@ def seek_near_day(raw, size, day, zone, budget, state):
         raw.seek(middle)
         chunk = raw.read(min(4096, size - middle, budget.maximum - budget.read))
         budget.tick(len(chunk))
-        dates, _ = probe_chunk(chunk.split(b'\n', 1)[-1], zone)
+        dates, _ = (local_log_probe if getattr(budget, 'local_dates', False) else probe_chunk)(
+            chunk.split(b'\n', 1)[-1], zone)
         if not dates or any(a > b for a, b in zip(dates, dates[1:])):
             state['notes'].add('No se pudo localizar la fecha con búsqueda rápida; lectura desde el inicio.')
             raw.seek(0)
@@ -449,11 +450,26 @@ def probe_chunk(data, zone):
     return dates, combined
 
 
-def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1, end_day=None):
+def local_log_probe(data, zone=None):
+    """Fechas locales de mensajes Fail2Ban; no convertir horas sin offset."""
+    dates = []
+    for line in data.splitlines(keepends=True):
+        if line.endswith(b'\n') and re.match(rb'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}.*fail2ban\.', line):
+            try:
+                dates.append(dt.date.fromisoformat(line[:10].decode('ascii')))
+            except (ValueError, UnicodeError):
+                pass
+    return dates, 0
+
+
+def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1, end_day=None, log_basename=None):
     """Elegir por fechas de extractos, no por una supuesta rotación diaria."""
     groups = collections.defaultdict(list)
     end_day = end_day or day
     for name in files:
+        if log_basename:
+            groups[log_basename].append(name)
+            continue
         match = re.match(r'^(?:proxy_)?access(?:_ssl)?_log', name)
         if match:
             groups[match[0]].append(name)
@@ -482,8 +498,9 @@ def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1, end
                     budget.tick(len(last))
                 if name.endswith('.gz'):
                     budget.tick(len(first))
-            a, _ = probe_chunk(first, zone)
-            b, _ = probe_chunk(last, zone)
+            probe = local_log_probe if log_basename else probe_chunk
+            a, _ = probe(first, zone)
+            b, _ = probe(last, zone)
             return a + b
         except (OSError, EOFError, ValueError, zlib.error):
             notes.add('No se pudo comprobar la fecha de ' + name)
@@ -513,7 +530,7 @@ def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1, end
             selected.update(name for date, name in zipped if day <= date <= end_day or date == latest)
             notes.add('Candidato gzip elegido por fecha inicial; no se ha verificado su fecha final.')
         else:
-            selected.update(quick_files(group, True, day_offset))
+            selected.update(quick_files(group, True, day_offset, log_basename))
             notes.add('No se confirmó un archivo para la fecha en los extractos; selección provisional.')
     notes.add('Selección por fechas de extractos: un intervalo compatible no garantiza registros de todo el día.')
     return [name for name in files if name in selected]
@@ -575,7 +592,7 @@ def inspect_logs(root, args):
 
 def read_fail2ban(args):
     result = dict(ips=set(), jails=collections.Counter(), events=0, notes=set(), inodes=set(),
-                  day_seen=False, read=0)
+                  day_seen=False, read=0, selected_files=[], earliest=None, latest=None)
     if args.no_fail2ban:
         result['notes'].add('Integración Fail2Ban desactivada por --no-fail2ban.')
         return result
@@ -591,11 +608,12 @@ def read_fail2ban(args):
         if not files:
             result['notes'].add('No se encontró el log de Fail2Ban. Puede usar journald/syslog u otra ruta.')
         files = historical_order(files, fd, args.historical)
-        if not getattr(args, 'full', False) and start_day == args.day:
-            chosen = quick_files(files, args.historical, getattr(args, 'day_offset', 1), basename)
-            if len(chosen) < len(files):
-                result['notes'].add('Fail2Ban rápido: se omiten otras rotaciones; no es el total histórico.')
-            files = chosen
+        if not getattr(args, 'full', False):
+            files = dated_quick_files(fd, files, start_day, None, budget, result['notes'],
+                                     getattr(args, 'day_offset', 1), end_day=args.day, log_basename=basename)
+            budget.local_dates = True
+            budget.seek_day = start_day
+        result['selected_files'] = files[:]
         for name in files:
             if name.endswith('.gz') and not args.gzip:
                 result['notes'].add('Históricos gzip de Fail2Ban omitidos para hoy; usa --gzip para incluirlos.')
@@ -609,6 +627,8 @@ def read_fail2ban(args):
                     if b'fail2ban.' in line:
                         try:
                             stamp_day = dt.date.fromisoformat(line[:10].decode('ascii'))
+                            result['earliest'] = min(result['earliest'] or stamp_day, stamp_day)
+                            result['latest'] = max(result['latest'] or stamp_day, stamp_day)
                             if start_day <= stamp_day <= args.day:
                                 result['day_seen'] = True
                         except (ValueError, UnicodeError):
@@ -648,6 +668,10 @@ def show_fail2ban(result, day):
         print('  N/D: no se leyeron mensajes de Fail2Ban para esta fecha.')
     print('  Histórico declarado por Fail2Ban para el período; no indica bloqueos activos.')
     print('  Hora local escrita en el log. Cobertura y retención no garantizadas.')
+    print('  Archivos seleccionados: ' + (', '.join(result.get('selected_files', [])) or 'ninguno'))
+    print(f'  Leídos: {result.get("read", 0) / 1048576:.2f} MiB (incluye extractos de selección).')
+    if result.get('earliest'):
+        print(f'  Fechas de mensajes recorridos: {result["earliest"]} a {result["latest"]}.')
     for note in sorted(result['notes']):
         print('  AVISO: ' + note)
     print()
