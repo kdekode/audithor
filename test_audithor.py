@@ -381,6 +381,55 @@ class Tests(unittest.TestCase):
             self.assertTrue(args.gzip)
             self.assertEqual(args.day, dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1))
 
+    def test_week_is_seven_calendar_days_with_same_fast_budget(self):
+        with patch.object(a, 'ZoneInfo', return_value=dt.timezone.utc):
+            args = a.arguments(['--week', '--timezone', 'UTC'])
+        self.assertEqual((args.day - args.start_day).days, 6)
+        self.assertEqual(args.day, dt.datetime.now(dt.timezone.utc).date())
+        self.assertTrue(args.sample)
+        self.assertTrue(args.gzip)
+        self.assertEqual((args.seconds, args.max_mib), (5, 8))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            a.arguments(['--week', '--yesterday'])
+
+    def test_week_aggregates_only_dates_in_period_and_keeps_minutes_separate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / 'access_log.processed'
+            data = b''.join(line('/day', stamp=f'{day:02d}/Oct/2026:12:00:00 +0000') * 3
+                            for day in range(12, 21))
+            path.write_bytes(data)
+            original_stat = os.stat
+            @contextlib.contextmanager
+            def opening(parent, name):
+                with path.open('rb') as stream:
+                    yield stream
+            args = type('Args', (), dict(domain=None, seconds=5, max_mib=8, gentle=False,
+                sample=True, historical=True, gzip=True, bans=None, day_offset=6,
+                start_day=dt.date(2026, 10, 13)))()
+            with patch.object(a, 'directory', return_value=999), patch.object(a, 'regular', opening), patch.object(a, 'names', return_value=[path.name]), patch.object(a.os, 'stat', side_effect=lambda name, **kwargs: original_stat(path)), patch.object(a.os, 'close'), patch.object(a, 'pressure', return_value=None), patch.object(a.time, 'sleep'):
+                result = a.analyze(0, 'example.com', dt.date(2026, 10, 19), dt.timezone.utc, args)
+            self.assertEqual(result['total'], 21)
+            self.assertEqual(result['peak'], 3)
+            self.assertEqual(len(result['minutes']), 7)
+            self.assertEqual(result['period_label'], '2026-10-13 a 2026-10-19')
+
+    def test_week_selects_older_archive_when_plain_only_covers_recent_days(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'access_log.processed').write_bytes(
+                line(stamp='17/Oct/2026:12:00:00 +0000') + line(stamp='19/Oct/2026:12:00:00 +0000'))
+            (root / 'access_log.processed.1.gz').write_bytes(gzip.compress(line(stamp='12/Oct/2026:12:00:00 +0000')))
+            (root / 'access_log.processed.2.gz').write_bytes(gzip.compress(line(stamp='07/Oct/2026:12:00:00 +0000')))
+            @contextlib.contextmanager
+            def opening(parent, name):
+                with (root / name).open('rb') as stream:
+                    yield stream
+            with patch.object(a, 'regular', opening), patch.object(a, 'pressure', return_value=None), patch.object(a.time, 'sleep'):
+                selected = a.dated_quick_files(0, [p.name for p in root.iterdir()], dt.date(2026, 10, 13),
+                    dt.timezone.utc, a.Budget(5, 8, rapid=True), set(), end_day=dt.date(2026, 10, 19))
+            self.assertEqual(set(selected), {'access_log.processed', 'access_log.processed.1.gz'})
+
     def test_signals_are_separate_from_bot_percentage(self):
         self.assertEqual(a.signals(dict(total=1000, counts={'bot': 1000})), [])
         findings = a.signals(dict(total=1000, http4=600, http5=150, sensitive4=30, peak=400))

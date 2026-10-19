@@ -1,4 +1,4 @@
-# Audithor 0.8.5
+# Audithor 0.9.0
 
 Creado por **steev anderson**. Inspección local de logs Linux/Plesk, en consola y sin dependencias de Python externas. Requiere Python 3.9+ y zonas horarias del sistema. No usa idxo-security ni su instalador.
 
@@ -45,10 +45,32 @@ Al finalizar repite **la misma tabla y columnas**, ordenada de mayor a menor nú
 python3 -I -B audithor.py                       # muestra de hoy
 python3 -I -B audithor.py ejemplo.com --yesterday
 python3 -I -B audithor.py --date 2026-10-18
+python3 -I -B audithor.py --week                # últimos 7 días, incluido hoy
 python3 -I -B audithor.py --yesterday --once    # como máximo los primeros 70
 ```
 
 `-I` aísla Python de variables/directorios de importación no deseados; `-B` evita crear bytecode. El lanzador permite `sh /ruta/audithor` y añade esas opciones. Sin terminal interactiva, se leen como máximo 70 dominios en modo normal. Ctrl+C durante el recorrido muestra el resumen parcial de los dominios terminados; otra interrupción termina el programa. Cerrar SSH o reiniciar el proceso pierde la posición: no hay caché ni reanudación entre ejecuciones. El resumen final también pagina cada 70 filas. Los límites por dominio y la regulación de recursos no cambian.
+
+## Últimos siete días
+
+`--week` analiza los últimos siete días naturales **incluido hoy**, en `--timezone` (Europe/Madrid por defecto). No es la semana anterior de lunes a domingo ni únicamente el fin de semana; hoy incluye solo los registros disponibles al leer. La cabecera muestra ambas fechas. Es incompatible con `--yesterday` y `--date`.
+
+```sh
+python3 -I -B audithor.py --week
+python3 -I -B audithor.py ejemplo.com --week
+```
+
+Las columnas suman los accesos leídos de ese intervalo; los porcentajes usan esas solicitudes y el pico sigue siendo el mayor minuto individual, no una media semanal. Minutos de días diferentes no se agrupan. Los errores internos y eventos Fail2Ban también se filtran por el intervalo, conservando sus límites y advertencias.
+
+La vista rápida **mantiene 5 segundos/8 MiB de accesos por dominio**, no los multiplica por siete. Selecciona archivos compatibles con el período y busca cerca de su inicio en texto. Si los `.processed` solo cubren días recientes, considera también inicios gzip para días anteriores. Puede encontrar datos solo de algunos días o de parte de cada archivo: es una muestra semanal, no un total semanal. No aumenta la concurrencia ni carga archivos enteros en RAM. El contador de minutos sigue acotado por la longitud del intervalo (hasta 1600 por día), dentro del mismo límite virtual de 128 MiB.
+
+Para un recorrido completo de una web:
+
+```sh
+python3 -I -B audithor.py ejemplo.com --week --full
+```
+
+Ese modo recorre los históricos de la capa seleccionada y puede tardar mucho, incluso al leer datos de otras fechas para filtrarlos. Mantiene las pausas por carga; más días no implican necesariamente agotar RAM, pero el volumen de CPU/disco y el tiempo pueden crecer. No garantiza impacto cero en un servidor activo. Empieza con la vista rápida.
 
 ## Ampliar solo lo necesario
 

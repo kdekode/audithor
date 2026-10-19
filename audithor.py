@@ -28,7 +28,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.8.5'
+VERSION = '0.9.0'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -449,9 +449,10 @@ def probe_chunk(data, zone):
     return dates, combined
 
 
-def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1):
+def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1, end_day=None):
     """Elegir por fechas de extractos, no por una supuesta rotación diaria."""
     groups = collections.defaultdict(list)
+    end_day = end_day or day
     for name in files:
         match = re.match(r'^(?:proxy_)?access(?:_ssl)?_log', name)
         if match:
@@ -490,22 +491,26 @@ def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1):
     for base, group in groups.items():
         plain = [n for n in group if not n.endswith('.gz')]
         compatible = []
+        covers_period = False
         for name in plain:
             dates = dates_in(name)
-            if dates and min(dates) <= day <= max(dates):
+            if dates and min(dates) <= end_day and max(dates) >= day:
                 compatible.append(name)
+                covers_period = covers_period or (min(dates) <= day and max(dates) >= end_day)
         if compatible:
             selected.update(compatible)
-            continue
+            if covers_period:
+                continue
         # En gzip solo conocemos el inicio: el más reciente anterior al día es candidato.
         zipped = []
         for name in (n for n in group if n.endswith('.gz')):
             dates = dates_in(name)
-            if dates and min(dates) <= day:
+            if dates and min(dates) <= end_day:
                 zipped.append((min(dates), name))
         if zipped:
-            latest = max(date for date, _ in zipped)
-            selected.update(name for date, name in zipped if date == latest)
+            preceding = [date for date, _ in zipped if date <= day]
+            latest = max(preceding) if preceding else None
+            selected.update(name for date, name in zipped if day <= date <= end_day or date == latest)
             notes.add('Candidato gzip elegido por fecha inicial; no se ha verificado su fecha final.')
         else:
             selected.update(quick_files(group, True, day_offset))
@@ -523,9 +528,9 @@ def inspect_logs(root, args):
         primary, _, layer = sources(fd, True, args.historical)
         probe_notes = set()
         chosen = set(primary if args.full else dated_quick_files(
-            fd, historical_order(primary, fd, args.historical), args.day, args.zone,
-            Budget(1, 2, rapid=True), probe_notes, args.day_offset))
-        print(f'\nINSPECCIÓN DE LOGS · {args.domain} · fecha solicitada {args.day} · {args.timezone}')
+            fd, historical_order(primary, fd, args.historical), getattr(args, 'start_day', args.day), args.zone,
+            Budget(1, 2, rapid=True), probe_notes, args.day_offset, end_day=args.day))
+        print(f'\nINSPECCIÓN DE LOGS · {args.domain} · período {getattr(args, "period_label", args.day)} · {args.timezone}')
         print(f'Fuente que usaría el análisis: {layer.upper()}. * = archivo seleccionado.')
         print('Cada fecha es SOLO del extracto leído; no demuestra la cobertura completa.')
         print('Gzip: inicio de hasta 16 KiB. Texto: inicio y final de hasta 16 KiB cada uno.')
@@ -575,6 +580,7 @@ def read_fail2ban(args):
         result['notes'].add('Integración Fail2Ban desactivada por --no-fail2ban.')
         return result
     budget = Budget(min(args.seconds, 3), min(args.max_mib, 2), args.gentle, rapid=True)
+    start_day = getattr(args, 'start_day', args.day)
     parent, basename = os.path.split(os.path.abspath(args.fail2ban_log))
     fd = None
     try:
@@ -585,7 +591,7 @@ def read_fail2ban(args):
         if not files:
             result['notes'].add('No se encontró el log de Fail2Ban. Puede usar journald/syslog u otra ruta.')
         files = historical_order(files, fd, args.historical)
-        if not getattr(args, 'full', False):
+        if not getattr(args, 'full', False) and start_day == args.day:
             chosen = quick_files(files, args.historical, getattr(args, 'day_offset', 1), basename)
             if len(chosen) < len(files):
                 result['notes'].add('Fail2Ban rápido: se omiten otras rotaciones; no es el total histórico.')
@@ -600,10 +606,15 @@ def read_fail2ban(args):
             try:
                 for line in scan(fd, name, budget, result):
                     # Fail2Ban suele registrar hora local sin offset; no inventar una conversión.
-                    if line[:10] == args.day.isoformat().encode() and b'fail2ban.' in line:
-                        result['day_seen'] = True
+                    if b'fail2ban.' in line:
+                        try:
+                            stamp_day = dt.date.fromisoformat(line[:10].decode('ascii'))
+                            if start_day <= stamp_day <= args.day:
+                                result['day_seen'] = True
+                        except (ValueError, UnicodeError):
+                            pass
                     event = parse_ban(line)
-                    if not event or event[0] != args.day:
+                    if not event or not start_day <= event[0] <= args.day:
                         continue
                     _, jail, ip = event
                     result['events'] += 1
@@ -635,7 +646,7 @@ def show_fail2ban(result, day):
             print(f'  {jail:<36} {count:>10,} eventos')
     else:
         print('  N/D: no se leyeron mensajes de Fail2Ban para esta fecha.')
-    print('  Histórico declarado por Fail2Ban; no indica bloqueos actualmente activos.')
+    print('  Histórico declarado por Fail2Ban para el período; no indica bloqueos activos.')
     print('  Hora local escrita en el log. Cobertura y retención no garantizadas.')
     for note in sorted(result['notes']):
         print('  AVISO: ' + note)
@@ -666,6 +677,10 @@ def analyze(root, domain, day, zone, args):
                  ip_counts=collections.Counter(), minutes=collections.Counter(), sensitive_urls=collections.Counter(),
                  f2b_seen=set(), sensitive=0, sensitive4=0, http4=0, http5=0, peak=0, peak_minute=None,
                  total=0, bytes=0, invalid=0, earliest=None, latest=None)
+    start_day = getattr(args, 'start_day', day)
+    period_days = (day - start_day).days + 1
+    state['period_days'] = period_days
+    state['period_label'] = str(start_day) + ' a ' + str(day) if period_days > 1 else str(day)
     bans = getattr(args, 'bans', None)
     state['f2b_matches'] = 0 if bans and bans['day_seen'] else None
     continuous = not getattr(args, 'sample', False)
@@ -686,7 +701,7 @@ def analyze(root, domain, day, zone, args):
         # Más reciente primero: útil para hoy con presupuesto acotado.
         files = historical_order(files, fd, args.historical)
         if not continuous:
-            chosen = dated_quick_files(fd, files, day, zone, budget, state['notes'], getattr(args, 'day_offset', 1))
+            chosen = dated_quick_files(fd, files, start_day, zone, budget, state['notes'], getattr(args, 'day_offset', 1), end_day=day)
             state['notes'].add('VISTA RÁPIDA: muestra de archivos probables; no es el total del día. Usa --full para ampliar.')
             if len(chosen) < len(files):
                 state['notes'].add(f'Se omiten {len(files) - len(chosen)} archivos de otras rotaciones.')
@@ -705,7 +720,7 @@ def analyze(root, domain, day, zone, args):
                 budget.end = time.monotonic() + max(0, total_end - time.monotonic()) / remaining_files
                 budget.maximum = budget.read + max(1, (total_maximum - budget.read) // remaining_files)
                 budget.tail = not args.historical
-                budget.seek_day = day if args.historical and not name.endswith('.gz') else None
+                budget.seek_day = start_day if args.historical and not name.endswith('.gz') else None
                 budget.zone = zone
             try:
                 for line in scan(fd, name, budget, state):
@@ -716,7 +731,7 @@ def analyze(root, domain, day, zone, args):
                     date, path, status, size, kind, ip, minute = event
                     state['earliest'] = min(date, state['earliest'] or date)
                     state['latest'] = max(date, state['latest'] or date)
-                    if date != day:
+                    if not start_day <= date <= day:
                         continue
                     state['total'] += 1
                     state['bytes'] += size
@@ -728,7 +743,7 @@ def analyze(root, domain, day, zone, args):
                     state['sensitive'] += int(probe)
                     state['sensitive4'] += int(probe and 400 <= status < 500)
                     # Un día tiene <=1500 minutos con cambio horario; límite defensivo.
-                    if minute in state['minutes'] or len(state['minutes']) < 1600:
+                    if minute in state['minutes'] or len(state['minutes']) < 1600 * period_days:
                         state['minutes'][minute] += 1
                         if state['minutes'][minute] > state['peak']:
                             state['peak'] = state['minutes'][minute]
@@ -770,7 +785,7 @@ def analyze(root, domain, day, zone, args):
                     try:
                         for line in scan(fd, name, budget, state):
                             event = error_event(line)
-                            if event and event[0] == day:
+                            if event and start_day <= event[0] <= day:
                                 state['internal'][event[1]] += 1
                     except (OSError, EOFError, ValueError, zlib.error):
                         state['notes'].add('No se pudo completar un log interno.')
@@ -809,16 +824,16 @@ def show(domain, day, result, detail=False):
     f2b = result.get('f2b_matches')
     print('\n' + '=' * 80)
     print(' ' + domain)
-    print(f' Fecha: {day}   |   Datos observados, cobertura del día no garantizada')
+    print(f' Período: {result.get("period_label") or day}   |   Datos observados, cobertura no garantizada')
     if result.get('rapid'):
-        print(' VISTA RÁPIDA · MUESTRA: las cifras no son el total diario.')
+        print(' VISTA RÁPIDA · MUESTRA: las cifras no son el total del período.')
     if result.get('layer'):
         print(' Fuente de accesos: ' + result['layer'].upper() + ' (una sola capa)')
     for name in result.get('selected_files', []):
         print(' Archivo seleccionado: ' + clean(name, 56))
     print('=' * 80 + '\n')
     metrics = [
-        ('Peticiones de la fecha leídas', f'{total:,}' if known else 'N/D'),
+        ('Peticiones del período leídas', f'{total:,}' if known else 'N/D'),
         ('Contenido enviado (según log)', f'{result["bytes"]/1048576:.2f} MiB' if known else 'N/D'),
         ('Bots / automatización probable', pct('bot')),
         ('Humano probable / desconocido', pct('probable') + ' / ' + pct('unknown')),
@@ -833,7 +848,7 @@ def show(domain, day, result, detail=False):
     print('\n  Una petición es un recurso solicitado: página, imagen, CSS, API, etc.')
     print('  El contenido enviado suma tamaños de respuesta; no mide RAM ni CPU.')
     print('  4xx: solicitudes rechazadas/no encontradas. 5xx: errores del servidor.')
-    print('  Los porcentajes 4xx/5xx usan todas las peticiones leídas de esta fecha.')
+    print('  Los porcentajes 4xx/5xx usan todas las peticiones leídas de este período.')
     peak = result.get('peak', 0)
     if total:
         level = activity_level(peak)
@@ -843,7 +858,7 @@ def show(domain, day, result, detail=False):
         print('  Nivel orientativo por volumen; no compara con el historial de esta web.')
         print('  Un pico alto puede ser normal. Incluye recursos y bots, no personas.')
     if detail:
-        print('\n  F2B: IP vistas en esta web y con evento Ban en el servidor ese día.')
+        print('\n  F2B: IP vistas en esta web y con evento Ban en el servidor en el período.')
         print('       Coincidencia; no demuestra que esta web originara el bloqueo.')
     findings = signals(result)
     if findings:
@@ -887,6 +902,8 @@ def compact_summary(result):
     summary['read'] = result.get('read', 0)
     summary['layer'] = result.get('layer')
     summary['rapid'] = result.get('rapid', False)
+    summary['period_label'] = result.get('period_label')
+    summary['period_days'] = result.get('period_days', 1)
     summary['selected_files'] = result.get('selected_files', [])
     for key in ('http4', 'http5', 'sensitive', 'sensitive4', 'peak'):
         summary[key] = result.get(key, 0)
@@ -1028,7 +1045,7 @@ def html_section(domain, result, args):
         ('Pico de peticiones/minuto', result.get('peak', 0)),
         ('Actividad orientativa por volumen del pico', activity_level(result.get('peak', 0)) if total else 'N/D'),
         ('Minuto del pico', result.get('peak_minute') or 'N/D'),
-        ('IP coincidentes con eventos Ban del día', result.get('f2b_matches') if result.get('f2b_matches') is not None else 'N/D'),
+        ('IP coincidentes con eventos Ban del período', result.get('f2b_matches') if result.get('f2b_matches') is not None else 'N/D'),
         ('Fuente de accesos', result.get('layer', 'N/D')),
         ('Archivos de la muestra', ', '.join(result.get('selected_files', [])) or 'Lectura ampliada / sin selección disponible'),
         ('Fechas encontradas en los logs', f'{result.get("earliest")} a {result.get("latest")}'),
@@ -1089,7 +1106,7 @@ class HtmlAudit:
 <title>Audithor · auditoría de tráfico</title>
 <style>body{font:16px/1.6 system-ui,sans-serif;max-width:1050px;margin:auto;padding:24px;background:#f1f5f9;color:#172033}section{background:white;padding:24px;margin:24px 0;border:1px solid #cbd5e1;border-radius:10px}table{width:100%;border-collapse:collapse;overflow-wrap:anywhere}th,td{text-align:left;padding:10px;border-bottom:1px solid #ddd}th{background:#e2e8f0}h1,h2,h3{line-height:1.3}small{color:#475569}</style><body>
 <h1>Audithor · auditoría de tráfico</h1><p>Creado por steev anderson.</p>''')
-        self.write('<p>Fecha analizada: ' + html.escape(str(args.day)) + ' · Zona: ' + html.escape(args.timezone) +
+        self.write('<p>Período analizado: ' + html.escape(str(getattr(args, 'period_label', args.day))) + ' · Zona: ' + html.escape(args.timezone) +
                    f' · Dominios seleccionados: {total} · Versión: {VERSION}</p>')
         self.write('<p>Informe de logs disponibles. Una petición puede ser una página, imagen, CSS o API; no equivale a una persona. '
                    'Transferencia es el tamaño de respuestas registrado; 4xx son rechazos/no encontrados y 5xx errores del servidor. '
@@ -1154,7 +1171,7 @@ def finish_audit(args, rows):
 
 def collect_ranked(root, domains, day, zone, args):
     rows = []
-    print('\nUna fila por dominio. Peticiones/porcentajes se refieren a los accesos leídos de la fecha.')
+    print('\nUna fila por dominio. Peticiones/porcentajes se refieren a los accesos leídos del período.')
     print('MiB = contenido enviado; HUM. = humano probable; DESC. = desconocido; 4xx/5xx = número de respuestas.')
     print('ESTADO: REV:n = umbrales activados; M = muestra, no total diario; A = avisos; SIN FECHA = sin accesos de la fecha.')
     print('BAJA/MODERADA/ALTA = volumen orientativo del pico; no confirma ni descarta ataques.')
@@ -1202,6 +1219,7 @@ def arguments(argv=None):
     dates = parser.add_mutually_exclusive_group()
     dates.add_argument('--yesterday', action='store_true', help='Ayer en la zona horaria elegida')
     dates.add_argument('--date', help='Fecha YYYY-MM-DD; solo si quedan logs')
+    dates.add_argument('--week', action='store_true', help='Últimos siete días naturales, incluido hoy, en la zona elegida')
     parser.add_argument('--timezone', default='Europe/Madrid')
     parser.add_argument('--root', default='/var/www/vhosts/system', help='Raíz de logs Plesk; no se modifica')
     parser.add_argument('--gzip', action='store_true', help='Incluir históricos comprimidos dentro del mismo presupuesto')
@@ -1233,8 +1251,10 @@ def arguments(argv=None):
         args.day = dt.date.fromisoformat(args.date) if args.date else today - dt.timedelta(days=int(args.yesterday))
         if args.day > today:
             parser.error('No se pueden analizar fechas futuras.')
-        args.historical = args.day < today
-        args.day_offset = (today - args.day).days
+        args.start_day = args.day - dt.timedelta(days=6) if args.week else args.day
+        args.period_label = str(args.start_day) + ' a ' + str(args.day) if args.week else str(args.day)
+        args.historical = args.start_day < today
+        args.day_offset = (today - args.start_day).days
         # --yesterday debe buscar automáticamente en los históricos comprimidos.
         args.gzip = args.gzip or args.historical
     except (ValueError, ZoneInfoNotFoundError):
@@ -1267,7 +1287,7 @@ def main(argv=None):
         raise RuntimeError('No se pudieron aplicar los límites locales: ' + str(exc))
     print(BANNER)
     print('Audithor ' + VERSION)
-    print(f'Fecha: {args.day} ({args.timezone}). Secuencial; memoria virtual máxima 128 MiB.')
+    print(f'Período: {args.period_label} ({args.timezone}). Secuencial; memoria virtual máxima 128 MiB.')
     print(f'Tandas de {args.seconds}s/{args.max_mib} MiB. ' + ('MUESTRA limitada por dominio.' if args.sample else 'LECTURA CONTINUA: descansa y continúa hasta finalizar los archivos seleccionados.'))
     print('Logs en solo lectura. Sin instalaciones, cron ni cambios en Plesk, servicios o permisos de las webs.')
     if args.report:
@@ -1299,7 +1319,7 @@ def main(argv=None):
             print('\nLeyendo historial Fail2Ban…', flush=True)
             args.bans = read_fail2ban(args)
             if args.domain:
-                show_fail2ban(args.bans, args.day)
+                show_fail2ban(args.bans, args.period_label)
         if args.report:
             args.audit = HtmlAudit(args, len(domains))
             print('Creando informe privado: ' + args.audit.path, flush=True)
