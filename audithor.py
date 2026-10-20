@@ -36,7 +36,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.12.0'
+VERSION = '0.12.1'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -241,7 +241,7 @@ class RunGuard:
                 raise SafetyLimit('Ya hay otra ejecución de Audithor; no se ha iniciado el análisis.')
             os.nice(19)
             for kind, maximum in ((resource.RLIMIT_AS, 128 * 1048576),
-                                  (resource.RLIMIT_CPU, math.ceil(time.process_time()) + args.cpu_seconds)):
+                                  (resource.RLIMIT_CPU, math.ceil(time.process_time()) + self.args.cpu_seconds)):
                 soft, hard = resource.getrlimit(kind)
                 cap = min(maximum, hard) if hard != resource.RLIM_INFINITY else maximum
                 if soft != resource.RLIM_INFINITY:
@@ -253,7 +253,7 @@ class RunGuard:
                 raise SafetyLimit('Límite efectivo de tiempo/CPU alcanzado; auditoría interrumpida y parcial.')
             for sig in (signal.SIGALRM, signal.SIGXCPU):
                 self.old_handlers[sig] = signal.signal(sig, stop)
-            signal.setitimer(signal.ITIMER_REAL, args.run_seconds)
+            signal.setitimer(signal.ITIMER_REAL, self.args.run_seconds)
             RUN_GUARD = self
             return self
         except BaseException:

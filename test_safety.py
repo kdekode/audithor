@@ -19,6 +19,55 @@ from test_audithor import line
 
 
 class SafetyTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def mocked_linux_guard(self):
+        """Exercise startup on every platform without changing real OS limits."""
+        fcntl = types.SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=MagicMock())
+        resource = types.SimpleNamespace(
+            RLIMIT_AS=9, RLIMIT_CPU=0, RLIM_INFINITY=-1,
+            getrlimit=MagicMock(return_value=(-1, -1)), setrlimit=MagicMock())
+        info = types.SimpleNamespace(st_mode=0o100600, st_uid=123, st_nlink=1)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, fcntl=fcntl, resource=resource))
+            stack.enter_context(patch.object(a.sys, 'platform', 'linux'))
+            for name, value in dict(O_NOFOLLOW=0, O_NONBLOCK=0).items():
+                stack.enter_context(patch.object(a.os, name, value, create=True))
+            for name, value in dict(SIGALRM=14, SIGXCPU=24, ITIMER_REAL=0).items():
+                stack.enter_context(patch.object(a.signal, name, value, create=True))
+            for name, value in dict(open=42, fstat=info, geteuid=123, nice=0, close=None).items():
+                stack.enter_context(patch.object(a.os, name, MagicMock(return_value=value), create=True))
+            stack.enter_context(patch.object(a.time, 'process_time', return_value=1.2))
+            stack.enter_context(patch.object(a.signal, 'signal', return_value='previous-handler'))
+            timer = stack.enter_context(patch.object(a.signal, 'setitimer', create=True))
+            stack.enter_context(patch.object(a, 'RUN_GUARD', None))
+            yield fcntl, resource, timer
+
+    def test_guard_startup_uses_instance_cpu_and_wall_budgets(self):
+        args = types.SimpleNamespace(run_mib=256, cpu_seconds=30, run_seconds=900)
+        with self.mocked_linux_guard() as (_, resource, timer):
+            with a.RunGuard(args) as guard:
+                self.assertIs(a.RUN_GUARD, guard)
+                resource.setrlimit.assert_any_call(resource.RLIMIT_CPU, (32, 33))
+                resource.setrlimit.assert_any_call(resource.RLIMIT_AS, (128 * 1048576, -1))
+                timer.assert_called_once_with(a.signal.ITIMER_REAL, 900)
+            self.assertIsNone(a.RUN_GUARD)
+            timer.assert_called_with(a.signal.ITIMER_REAL, 0)
+            a.os.close.assert_called_once_with(42)
+            a.signal.signal.assert_any_call(a.signal.SIGALRM, 'previous-handler')
+            a.signal.signal.assert_any_call(a.signal.SIGXCPU, 'previous-handler')
+
+    def test_guard_busy_lock_closes_descriptor_without_starting_limits(self):
+        args = types.SimpleNamespace(run_mib=256, cpu_seconds=30, run_seconds=900)
+        with self.mocked_linux_guard() as (fcntl, resource, timer):
+            fcntl.flock.side_effect = BlockingIOError()
+            with self.assertRaises(a.SafetyLimit):
+                with a.RunGuard(args):
+                    self.fail('A concurrent run must not start')
+            resource.setrlimit.assert_not_called()
+            timer.assert_not_called()
+            a.os.close.assert_called_once_with(42)
+            self.assertIsNone(a.RUN_GUARD)
+
     def test_unique_shared_ip_exact_and_categories_can_overlap(self):
         values = {key: a.UniqueIPs() for key in ('all', 'bot', 'probable', 'unknown')}
         for category in ('bot', 'probable', 'unknown', 'probable'):
