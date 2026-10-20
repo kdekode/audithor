@@ -14,6 +14,8 @@ import time
 import zlib
 import html
 import secrets
+import math
+import textwrap
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -28,7 +30,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.9.1'
+VERSION = '0.10.0'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -45,10 +47,12 @@ def clean(value, limit=180):
 
 
 def safe_path(raw):
-    path = raw.split('?', 1)[0].split('#', 1)[0]
+    path = unquote(raw).split('?', 1)[0].split('#', 1)[0]
     if not path.startswith('/'):
         return '[destino no relativo]'
     path = re.sub(r'[^/]*@[^/]+|(?<=/)[A-Za-z0-9_%=-]{32,}', ':redactado', path)
+    path = re.sub(r'(?i)(/(?:token|password|passwd|secret|api[_-]?key|authorization|session|reset)(?:/|=))[^/]+',
+                  r'\1:redactado', path)
     return clean(path, 180)
 
 
@@ -379,8 +383,12 @@ def error_event(line):
         return None
     low = text.lower()
     category = next((label for needle, label in (
+        ('max_children', 'Límite de procesos PHP-FPM'), ('maxclients', 'Límite de Apache'),
+        ('maxrequestworkers', 'Límite de Apache'), ('too many connections', 'Límite de conexiones backend'),
+        ('out of memory', 'Mensaje de falta de memoria'),
         ('fatal error', 'PHP fatal'), ('php warning', 'PHP warning'),
         ('upstream timed out', 'Timeout de upstream'), ('permission denied', 'Permiso denegado'),
+        ('connection refused', 'Conexión backend rechazada'),
         ('primary script unknown', 'Script PHP no encontrado'),
         ('[error]', 'Error del servidor'), ('[warn]', 'Aviso del servidor'),
         (':error]', 'Error del servidor'), (':warn]', 'Aviso del servidor')) if needle in low), 'Otros mensajes internos')
@@ -693,11 +701,331 @@ def activity_level(peak):
     return 'BAJA' if peak < 60 else 'MODERADA' if peak < 600 else 'ALTA' if peak < 3000 else 'MUY ALTA'
 
 
+# Diagnóstico: solo contadores del recorrido existente, sin nuevas lecturas de logs.
+THRESHOLDS = {
+    'health_min': 20, 'health_review_count': 5, 'health_review_pct': 5,
+    'health_critical_count': 20, 'health_critical_pct': 20,
+    'sensitive_review': 20, 'sensitive_high': 100, 'bot_pct': 50,
+    'sustained_rpm': 600, 'sustained_minutes': 3,
+    'gateway_count': 5, 'slow_seconds': 2, 'slow_pct': 50,
+    'timing_min': 20, 'timing_coverage_pct': 80,
+    'shared_domains': 2, 'shared_5xx_count': 5, 'shared_5xx_pct': 10,
+}
+HTTP_CODES = (400, 401, 403, 404, 408, 429, 500, 502, 503, 504)
+STATIC_PATH = re.compile(r'\.(?:css|js|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|map|txt)$', re.I)
+DYNAMIC_PATH = re.compile(r'\.php(?:/|$)|^/wp-json(?:/|$)|^/(?:api|cart|checkout)(?:/|$)', re.I)
+SATURATION = ('Límite de procesos PHP-FPM', 'Límite de Apache', 'Límite de conexiones backend')
+
+
+def timing_seconds(line):
+    """Solo sufijo explícito request_time=SEGUNDOS; nunca adivinar columnas numéricas."""
+    if b'request_time=' not in line:
+        return None
+    match = ACCESS.match(line)
+    if not match:
+        return None
+    tail = line[match.end():].strip()
+    value = re.fullmatch(rb'request_time=(\d{1,6}(?:\.\d{1,6})?)', tail)
+    return float(value[1]) if value else None
+
+
+def http_rows(result):
+    total = result.get('total', 0)
+    statuses = result.get('statuses', {})
+    rows = []
+    for code in HTTP_CODES:
+        count = statuses.get(code, 0)
+        rows.append((str(code), str(count) if total else 'N/D', f'{100*count/total:.1f}%' if total else 'N/D'))
+    for group in (4, 5):
+        count = sum(n for code, n in statuses.items() if code // 100 == group and code not in HTTP_CODES)
+        rows.append((f'Otros {group}xx', str(count) if total else 'N/D', f'{100*count/total:.1f}%' if total else 'N/D'))
+    return rows
+
+
+def sustained_peak(minutes, threshold):
+    """Mayor racha de minutos UTC consecutivos; ni huecos ni cambios DST se juntan."""
+    values = []
+    for label, count in minutes.items():
+        if count >= threshold:
+            stamp = dt.datetime.strptime(label, '%Y-%m-%d %H:%M %z')
+            values.append(int(stamp.timestamp() // 60))
+    longest = run = 0
+    previous = None
+    for minute in sorted(values):
+        run = run + 1 if previous is not None and minute == previous + 1 else 1
+        longest = max(longest, run)
+        previous = minute
+    return longest
+
+
+def diagnose_domain(result, thresholds=None):
+    t = thresholds or THRESHOLDS
+    total = result.get('total', 0)
+    health = suspicious = 'INDETERMINADO'
+    impact = 'NO DETERMINADO'
+    facts, hypotheses, actions = [], [], []
+    partial = result.get('rapid', False) or bool(result.get('invalid')) or any(
+        any(word in n.lower() for word in ('parcial', 'no se pudo', 'presupuesto', 'sin leer')) for n in result.get('notes', []))
+    confidence = 'LIMITADA: muestra o lectura incompleta' if partial else 'MEDIA: solo logs conservados'
+    if not total:
+        return dict(health=health, suspicious=suspicious, impact=impact, facts=['Sin accesos del período analizado.'],
+                    hypotheses=['No se puede valorar la salud ni el impacto.'], actions=['Revisar fechas, retención y avisos de lectura.'],
+                    confidence='INSUFICIENTE', attention=False, priority=(0, 0, 0), sustained=0)
+    errors = result.get('http5', 0)
+    error_pct = 100 * errors / total
+    if total >= t['health_min']:
+        health = 'OK'
+        if errors >= t['health_review_count'] and error_pct >= t['health_review_pct']:
+            health = 'REVISAR'
+        if errors >= t['health_critical_count'] and error_pct >= t['health_critical_pct']:
+            health = 'CRÍTICO'
+    facts.append(f'{errors} respuestas 5xx de {total} peticiones ({error_pct:.1f}% de las leídas).')
+    if health in ('REVISAR', 'CRÍTICO'):
+        hypotheses.append('Posible fallo de aplicación o backend; los 5xx no demuestran saturación.')
+        actions.append('En Plesk, revisar los logs de la web y PHP en los minutos indicados; distinguir 500 de 502/503/504.')
+    bot_pct = 100 * result.get('counts', {}).get('bot', 0) / total
+    sensitive = result.get('sensitive4', 0)
+    run = sustained_peak(result.get('minutes', {}), t['sustained_rpm'])
+    sustained = run >= t['sustained_minutes']
+    suspicious = 'BAJO'
+    if sensitive >= t['sensitive_review']:
+        suspicious = 'MODERADO'
+    if (sensitive >= t['sensitive_high'] and bot_pct >= t['bot_pct']) or (
+            sustained and bot_pct >= t['bot_pct'] and result.get('http4', 0) >= total / 2):
+        suspicious = 'ALTO'
+    if suspicious != 'BAJO':
+        facts.append(f'{sensitive} accesos sensibles con 4xx; automatización probable {bot_pct:.1f}%.')
+        hypotheses.append('Posible exploración automatizada; ni los 4xx ni el User-Agent identifican por sí solos un ataque.')
+        actions.append('Revisar rutas e IP de errores en Plesk. Si usas Cloudflare, estudiar desafíos limitados a rutas sensibles y tasas por IP antes de aplicar cambios.')
+        actions.append('Comprobar intentos repetidos de login/XML-RPC y archivos internos; evitar reglas generales sobre WordPress, WooCommerce o APIs.')
+    gateway = sum(result.get('statuses', {}).get(code, 0) for code in (502, 503, 504))
+    saturation = sum(result.get('internal', {}).get(label, 0) for label in SATURATION)
+    timings = result.get('timing_count', 0)
+    coverage = 100 * timings / total
+    slow = result.get('slow_count', 0)
+    timing_known = timings >= t['timing_min'] and coverage >= t['timing_coverage_pct']
+    if timing_known:
+        slow_pct = 100 * slow / timings
+        impact = 'POSIBLE' if slow_pct >= t['slow_pct'] else 'NO DETERMINADO'
+        # Bajo solo describe señales de latencia suficientemente muestreadas, no CPU/RAM.
+        if slow == 0 and not gateway and not saturation:
+            impact = 'BAJO'
+        if slow_pct >= t['slow_pct'] and sustained and gateway >= t['gateway_count']:
+            impact = 'ALTO POTENCIAL'
+        facts.append(f'Duración explícita en {timings} accesos ({coverage:.1f}%); {slow} de al menos {t["slow_seconds"]:g} s.')
+    if saturation or (sustained and gateway >= t['gateway_count']):
+        if impact != 'ALTO POTENCIAL':
+            impact = 'POSIBLE'
+    if run:
+        facts.append(f'{run} minuto(s) consecutivos con al menos {t["sustained_rpm"]:g} peticiones/min.')
+    if saturation:
+        facts.append(f'{saturation} mensajes internos sobre límites de procesos o conexiones en el período.')
+    if impact in ('POSIBLE', 'ALTO POTENCIAL'):
+        hypotheses.append('Posible presión sobre aplicación/backend. No se ha medido consumo ni concurrencia por dominio.')
+        actions.append('En Plesk, revisar límites y logs del pool PHP-FPM, colas/tiempos del backend y errores de conexiones de MySQL/MariaDB en esa franja.')
+    if impact == 'NO DETERMINADO':
+        hypotheses.append('Sin métricas suficientes de duración, concurrencia o límites alcanzados para atribuir carga.')
+    hints = result.get('fourxx_hints', {})
+    if result.get('http4'):
+        facts.append(f'4xx por aspecto de la ruta: estática {hints.get("static", 0)}, dinámica {hints.get("dynamic", 0)}, desconocida {hints.get("unknown", 0)}.')
+        hypotheses.append('Una ruta estática puede ser barata y una dinámica pasar por PHP; la ruta no demuestra qué proceso respondió ni su coste.')
+        actions.append('Revisar redirecciones y reglas de la web: un 404 de WordPress puede ejecutar PHP; un 403 puede resolverse antes.')
+    if errors:
+        actions.append('Cloudflare no corrige fallos internos de aplicación; investigar primero el origen de los 5xx.')
+    at_peak = result.get('error_minutes', {}).get(result.get('peak_minute'), (0, 0, 0))
+    facts.append(f'Errores en el minuto de mayor tráfico: {at_peak[0]} 4xx y {at_peak[1]} 5xx (coincidencia, no causalidad).')
+    attention = health in ('REVISAR', 'CRÍTICO') or suspicious != 'BAJO' or impact in ('POSIBLE', 'ALTO POTENCIAL')
+    priority = (int(health == 'CRÍTICO') * 2 + int(health == 'REVISAR'),
+                {'NO DETERMINADO': 0, 'BAJO': 0, 'POSIBLE': 1, 'ALTO POTENCIAL': 2}[impact],
+                {'BAJO': 0, 'MODERADO': 1, 'ALTO': 2}[suspicious])
+    return dict(health=health, suspicious=suspicious, impact=impact, facts=facts, hypotheses=hypotheses,
+                actions=actions, confidence=confidence, attention=attention, priority=priority, sustained=run)
+
+
+class SharedIncidents:
+    """Una instancia por ejecución/servidor; memoria acotada, sin importar informes previos."""
+    def __init__(self, thresholds=None):
+        self.thresholds = thresholds or THRESHOLDS
+        self.windows = {}
+        self.partial = False
+
+    def add(self, domain, result):
+        t = self.thresholds
+        # Solo guardamos ventanas con errores relevantes o picos, no todos los minutos.
+        for minute, count in result.get('minutes', {}).items():
+            e4, e5, gateway = result.get('error_minutes', {}).get(minute, (0, 0, 0))
+            five = e5 >= t['shared_5xx_count'] and 100 * e5 / count >= t['shared_5xx_pct']
+            peak = count >= t['sustained_rpm']
+            if not five and not peak:
+                continue
+            if minute not in self.windows:
+                if len(self.windows) >= 2048:
+                    self.partial = True
+                    continue
+                self.windows[minute] = [set(), set(), set()]
+            groups = self.windows[minute]
+            for yes, group in zip((five, peak, five and gateway >= t['shared_5xx_count']), groups):
+                if yes:
+                    if len(group) < 8:
+                        group.add(domain)
+                    else:
+                        self.partial = True
+
+    def findings(self):
+        out = []
+        for minute, groups in sorted(self.windows.items()):
+            for label, group in zip(('5xx coincidentes', 'Picos coincidentes', '502/503/504 coincidentes'), groups):
+                if len(group) >= self.thresholds['shared_domains']:
+                    out.append((minute, label, ', '.join(sorted(group))))
+                    if len(out) == 20:
+                        return out
+        return out
+
+
+def diagnosis_key(row):
+    domain, result = row
+    d = result.get('diagnosis') or diagnose_domain(result)
+    return tuple(-v for v in d['priority']) + (-result.get('http5', 0), domain)
+
+
+def attention_values(domain, result):
+    d = result.get('diagnosis') or diagnose_domain(result)
+    total = result.get('total', 0)
+    return (domain, total, result.get('http4', 0), result.get('http5', 0),
+            f'{100*result.get("http5", 0)/total:.1f}%' if total else 'N/D', result.get('peak', 0),
+            d['health'], d['suspicious'], d['impact'])
+
+
+ATTENTION_HEADERS = ('DOMINIO', 'PETICIONES', '4xx', '5xx', '%5xx', 'PICO/MIN', 'SALUD WEB', 'SOSPECHOSO', 'IMPACTO POTENCIAL')
+
+
+def show_diagnosis(d):
+    print('\n  DIAGNÓSTICO DEL PERÍODO LEÍDO')
+    table(('INDICADOR', 'RESULTADO'), [('Salud web', d['health']), ('Tráfico sospechoso', d['suspicious']),
+                                     ('Impacto potencial', d['impact'])], (26, 40))
+    for label, key in (('Hechos', 'facts'), ('Hipótesis', 'hypotheses'), ('Qué revisar', 'actions')):
+        print('\n  ' + label + ':')
+        for item in d[key]:
+            # Mantener legible el detalle en terminales de 90 columnas.
+            print(textwrap.fill(item, width=88, initial_indent='    - ', subsequent_indent='      '))
+    print('  Confianza: ' + d['confidence'])
+    print('  OK/BAJO se refieren a lo leído; no certifican la web ni el servidor.')
+
+
+def show_attention(rows, shared=None):
+    print('\nDOMINIOS QUE REQUIEREN ATENCIÓN · solo esta ejecución y servidor')
+    selected = sorted((r for r in rows if (r[1].get('diagnosis') or diagnose_domain(r[1]))['attention']), key=diagnosis_key)
+    table(ATTENTION_HEADERS, [attention_values(*r) for r in selected[:100]], (32, 10, 7, 7, 7, 8, 13, 13, 17))
+    if not selected:
+        print('  Sin condiciones activadas en los datos leídos; no descarta problemas ni falta de cobertura.')
+    for domain, result in selected[:100]:
+        print('\n  ' + domain)
+        show_diagnosis(result.get('diagnosis') or diagnose_domain(result))
+    if len(selected) > 100:
+        print('  Se muestran los primeros 100; consulta el detalle del resto por dominio.')
+    if shared:
+        findings = shared.findings()
+        if findings:
+            print('\nPOSIBLE INCIDENCIA COMPARTIDA DEL SERVIDOR')
+            table(('MINUTO', 'HECHO OBSERVADO', 'DOMINIOS'), findings, (28, 28, 65))
+            print('  Hipótesis: revisar servicios comunes en esa franja. Sin línea base no se demuestra un aumento ni una causa compartida.')
+        else:
+            print('\nSin coincidencias compartidas que alcancen los umbrales en la lectura.')
+        print('  Correlación de accesos del mismo recorrido; no se mezclan servidores ni ejecuciones. Muestras pueden ocultar coincidencias.')
+        if shared.partial:
+            print('  Correlación PARCIAL: máximo 2048 minutos y 8 dominios por grupo; se muestran hasta 20 coincidencias.')
+
+
+def current_resources():
+    """Instantánea opcional /proc, sin sockets, comandos ni datos de otras fechas."""
+    result = dict(values=[], notes=[])
+    deadline = time.monotonic() + .5
+    read = 0
+    def small(path, maximum):
+        nonlocal read
+        if time.monotonic() >= deadline or read + maximum > 256 * 1024:
+            raise ValueError('Límite de instantánea alcanzado.')
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            data = os.read(fd, maximum)
+            read += len(data)
+            return data.decode('ascii', 'replace')
+        finally:
+            os.close(fd)
+    try:
+        cpus, loads, available = host_status()
+        result['values'].extend([('CPU lógicas', str(cpus)), ('Carga 1/5/15 min', ' / '.join(f'{v:.2f}' for v in loads)),
+                                 ('Memoria disponible', f'{available:.0f} MiB')])
+        read += 8192
+    except (OSError, ValueError, AttributeError):
+        result['notes'].append('Carga/memoria no disponibles.')
+    for resource in ('cpu', 'memory', 'io'):
+        try:
+            data = small('/proc/pressure/' + resource, 4096)
+            for line in data.splitlines():
+                match = re.fullmatch(r'(some|full) avg10=([0-9.]+) avg60=([0-9.]+) avg300=([0-9.]+) total=\d+', line)
+                if match:
+                    result['values'].append((f'PSI {resource} {match[1]} (10/60/300 s)', ' / '.join(match.groups()[1:]) + ' %'))
+        except (OSError, ValueError, AttributeError):
+            result['notes'].append('PSI ' + resource + ': N/D (permisos o kernel sin soporte).')
+    try:
+        data = small('/proc/vmstat', 16384)
+        match = re.search(r'^oom_kill (\d+)$', data, re.M)
+        result['values'].append(('OOM kill acumulado desde arranque', match[1] if match else 'N/D'))
+    except (OSError, ValueError, AttributeError):
+        result['notes'].append('Contador OOM: N/D.')
+    counts = collections.Counter()
+    visited = 0
+    partial = False
+    try:
+        with os.scandir('/proc') as entries:
+            for entry in entries:
+                if not entry.name.isascii() or not entry.name.isdecimal():
+                    continue
+                if visited >= 512 or time.monotonic() >= deadline:
+                    partial = True
+                    break
+                visited += 1
+                try:
+                    comm = small('/proc/' + entry.name + '/comm', 64).strip()
+                    label = ('PHP-FPM' if comm.startswith('php-fpm') else
+                             'MySQL/MariaDB' if comm in ('mysqld', 'mariadbd') else
+                             'nginx/Apache' if comm in ('nginx', 'apache2', 'httpd') else None)
+                    if label:
+                        counts[label] += 1
+                except (OSError, ValueError, AttributeError):
+                    partial = True
+        for label in ('PHP-FPM', 'MySQL/MariaDB', 'nginx/Apache'):
+            result['values'].append(('Procesos observados ' + label, str(counts[label]) + (' (parcial)' if partial else '')))
+    except (OSError, AttributeError):
+        result['notes'].append('Inventario de procesos: N/D.')
+    result['notes'].extend([
+        'Instantánea ACTUAL del servidor; no corresponde a ayer ni atribuye CPU/RAM a dominios.',
+        'PSI indica tiempo de espera por recursos; carga media no es porcentaje de CPU.',
+        'OOM es acumulado desde arranque: no identifica fechas, procesos ni la causa de un error HTTP.',
+        'Contar procesos no mide concurrencia, colas ni saturación de pools PHP-FPM.',
+        'Sin consultar sockets/HTTP ni credenciales: estado de pools y conexiones SQL N/D. Revisar logs y métricas ya disponibles en Plesk.',
+        'Máximo 0,5 s cooperativos, 256 KiB y 512 procesos; archivos ausentes o sin permiso se omiten.',
+    ])
+    result['read'] = read
+    return result
+
+
+def show_current_resources():
+    print('\nRECURSOS ACTUALES DEL SERVIDOR · ' + dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'))
+    data = current_resources()
+    table(('MEDIDA', 'RESULTADO'), data['values'], (43, 38))
+    for note in data['notes']:
+        print('  ' + note)
+
+
 def analyze(root, domain, day, zone, args):
     detailed = bool(args.domain or getattr(args, 'report', False))
     state = dict(inodes=set(), notes=set(), counts=collections.Counter(), urls=collections.Counter(),
                  bytes_urls=collections.Counter(), errors=collections.Counter(), statuses=collections.Counter(),
                  internal=collections.Counter(),
+                 error_clients=collections.Counter(), error_minutes={}, fourxx_hints=collections.Counter(),
+                 timing_count=0, slow_count=0, timing_sum=0.0, timing_max=0.0,
                  ip_counts=collections.Counter(), minutes=collections.Counter(), sensitive_urls=collections.Counter(),
                  f2b_seen=set(), sensitive=0, sensitive4=0, http4=0, http5=0, peak=0, peak_minute=None,
                  total=0, bytes=0, invalid=0, earliest=None, latest=None)
@@ -772,6 +1100,22 @@ def analyze(root, domain, day, zone, args):
                         if state['minutes'][minute] > state['peak']:
                             state['peak'] = state['minutes'][minute]
                             state['peak_minute'] = minute
+                        if status >= 400:
+                            counts = state['error_minutes'].setdefault(minute, [0, 0, 0])
+                            counts[0] += int(status < 500)
+                            counts[1] += int(status >= 500)
+                            counts[2] += int(status in (502, 503, 504))
+                    else:
+                        state['notes'].add('Límite de minutos: distribución temporal y correlación parciales.')
+                    if 400 <= status < 500:
+                        hint = 'dynamic' if DYNAMIC_PATH.search(path) else 'static' if STATIC_PATH.search(path) else 'unknown'
+                        state['fourxx_hints'][hint] += 1
+                    duration = timing_seconds(line)
+                    if duration is not None:
+                        state['timing_count'] += 1
+                        state['slow_count'] += int(duration >= getattr(args, 'thresholds', THRESHOLDS)['slow_seconds'])
+                        state['timing_sum'] += duration
+                        state['timing_max'] = max(state['timing_max'], duration)
                     if bans and ip in bans['ips']:
                         state['f2b_seen'].add(ip)
                     if detailed:
@@ -783,6 +1127,7 @@ def analyze(root, domain, day, zone, args):
                         increment(state['bytes_urls'], path, size)
                         if status >= 400:
                             increment(state['errors'], str(status) + ' ' + path)
+                            increment(state['error_clients'], ip, overflow='[otras IP: límite de memoria]')
             except (OSError, EOFError, ValueError, zlib.error) as exc:
                 state['notes'].add('No se pudo completar ' + clean(name) + ': ' + clean(str(exc)))
         if detailed:
@@ -822,6 +1167,7 @@ def analyze(root, domain, day, zone, args):
         state['f2b_matches'] = len(state['f2b_seen']) if state['read'] else None
     if state['invalid']:
         state['notes'].add(f"{state['invalid']} líneas no interpretadas; cobertura parcial.")
+    state['diagnosis'] = diagnose_domain(state, getattr(args, 'thresholds', THRESHOLDS))
     return state
 
 
@@ -902,13 +1248,21 @@ def show(domain, day, result, detail=False):
         for note in sorted(result['notes']):
             print('    - ' + note)
     if detail:
+        show_diagnosis(result.get('diagnosis') or diagnose_domain(result))
+        print('\n  Códigos HTTP: porcentaje sobre todas las peticiones leídas del período\n')
+        table(('CÓDIGO', 'RESPUESTAS', '% PETICIONES'), http_rows(result), (12, 14, 18))
+        temporal_rows = sorted(result.get('error_minutes', {}).items(), key=lambda item: (-sum(item[1][:2]), item[0]))[:10]
+        print('\n  Minutos con más errores (no toda la distribución)\n')
+        table(('MINUTO', '4xx', '5xx', '502/503/504', 'PETICIONES'),
+              [(m, e[0], e[1], e[2], result['minutes'][m]) for m, e in temporal_rows], (28, 7, 7, 12, 12))
         for title, key, unit in [('URLs con más peticiones', 'urls', 'PETICIONES'),
                                  ('URLs con más transferencia (no mide CPU)', 'bytes_urls', 'BYTES'),
                                  ('Errores HTTP 4xx/5xx por URL', 'errors', 'PETICIONES'),
                                  ('Accesos a rutas sensibles (incluye usos legítimos)', 'sensitive_urls', 'PETICIONES'),
-                                 ('IP con más peticiones (dirección registrada)', 'ip_counts', 'PETICIONES')]:
+                                 ('IP con más peticiones (dirección registrada)', 'ip_counts', 'PETICIONES'),
+                                 ('IP con más respuestas de error', 'error_clients', 'ERRORES')]:
             print('\n  ' + title + '\n')
-            rows = [(f'{count:,}', path) for path, count in result[key].most_common(10)]
+            rows = [(f'{count:,}', path) for path, count in result.get(key, collections.Counter()).most_common(10)]
             table((unit, 'RUTA / IP'), rows, (12, 62))
             if not rows:
                 print('  Sin datos observados.')
@@ -933,6 +1287,7 @@ def compact_summary(result):
         summary[key] = result.get(key, 0)
     summary['peak_minute'] = result.get('peak_minute')
     summary['f2b_matches'] = result.get('f2b_matches')
+    summary['diagnosis'] = result.get('diagnosis') or diagnose_domain(result)
     summary['counts'] = collections.Counter({key: result['counts'][key] for key in ('bot', 'probable', 'unknown')})
     notes = sorted(result['notes'])
     summary['notes'] = [clean(note, 240) for note in notes[:8]]
@@ -1075,13 +1430,26 @@ def html_section(domain, result, args):
         ('Fechas encontradas en los logs', f'{result.get("earliest")} a {result.get("latest")}'),
     ]
     output = '<section><h2>' + esc(domain) + '</h2>' + html_table(('Métrica', 'Resultado'), metrics)
+    d = result.get('diagnosis') or diagnose_domain(result, getattr(args, 'thresholds', THRESHOLDS))
+    output += '<h3>Diagnóstico del período leído</h3>' + html_table(
+        ('Salud web', 'Tráfico sospechoso', 'Impacto potencial'), [(d['health'], d['suspicious'], d['impact'])])
+    output += '<p>Confianza: ' + esc(d['confidence']) + '. OK/BAJO solo describen lo leído.</p>'
+    for title, key in (('Hechos medidos', 'facts'), ('Hipótesis', 'hypotheses'), ('Qué revisar en Plesk', 'actions')):
+        output += '<h3>' + title + '</h3><ul>' + ''.join('<li>' + esc(item) + '</li>' for item in d[key]) + '</ul>'
+    output += '<h3>Códigos HTTP · porcentaje de todas las peticiones leídas</h3>' + html_table(
+        ('Código', 'Respuestas', '% peticiones'), http_rows(result))
+    windows = sorted(result.get('error_minutes', {}).items(), key=lambda item: (-sum(item[1][:2]), item[0]))[:20]
+    output += '<h3>Minutos con más errores (distribución limitada)</h3>' + html_table(
+        ('Minuto', '4xx', '5xx', '502/503/504', 'Peticiones'),
+        [(m, e[0], e[1], e[2], result.get('minutes', {}).get(m, 0)) for m, e in windows])
     findings = signals(result)
     output += '<h3>Indicadores para revisar</h3><ul>' + ''.join('<li>' + esc(f) + '</li>' for f in findings) + '</ul>'
     if not findings:
         output += '<p>Sin umbrales activados en los datos leídos; no descarta un ataque.</p>'
     for title, key in [('URLs con más peticiones', 'urls'), ('URLs con más bytes de respuesta', 'bytes_urls'),
                        ('Errores HTTP por ruta', 'errors'), ('Rutas sensibles consultadas', 'sensitive_urls'),
-                       ('IP con más peticiones', 'ip_counts'), ('Mensajes internos por categoría', 'internal'),
+                       ('IP con más peticiones', 'ip_counts'), ('IP con más respuestas de error', 'error_clients'),
+                       ('Mensajes internos por categoría', 'internal'),
                        ('Códigos HTTP', 'statuses')]:
         values = result.get(key, collections.Counter())
         output += '<h3>' + esc(title) + '</h3>'
@@ -1132,6 +1500,9 @@ class HtmlAudit:
 <h1>Audithor · auditoría de tráfico</h1><p>Creado por steev anderson.</p>''')
         self.write('<p>Período analizado: ' + html.escape(str(getattr(args, 'period_label', args.day))) + ' · Zona: ' + html.escape(args.timezone) +
                    f' · Dominios seleccionados: {total} · Versión: {VERSION}</p>')
+        self.write('<p>Servidor de esta ejecución: ' + html.escape(getattr(args, 'server_label', 'servidor local')) +
+                   '. Correlación limitada a este recorrido; no se importan resultados de otros servidores.</p>')
+        self.write('<p>Umbrales de diagnóstico: ' + html.escape(', '.join(f'{k}={v:g}' for k, v in getattr(args, 'thresholds', THRESHOLDS).items())) + '</p>')
         self.write('<p>Informe de logs disponibles. Una petición puede ser una página, imagen, CSS o API; no equivale a una persona. '
                    'Transferencia es el tamaño de respuestas registrado; 4xx son rechazos/no encontrados y 5xx errores del servidor. '
                    'Los porcentajes usan las peticiones leídas de la fecha. Bots y humanos son estimaciones. '
@@ -1167,11 +1538,19 @@ class HtmlAudit:
         complete = len(rows) == self.total and self.domains == self.total and not self.truncated
         status = 'Recorrido terminado' if complete else 'INFORME PARCIAL: recorrido interrumpido o límite de tamaño alcanzado'
         footer = '<section><h2>Resumen final · ' + status + '</h2><p>' + str(len(rows)) + '/' + str(self.total) + ' dominios consultados.</p>'
-        footer += '<p>Orden orientativo de revisión: número de umbrales, rutas sensibles con 4xx, errores 5xx/4xx y tráfico. No mide ataques ni daños.</p>'
-        footer += html_table(('Dominio', 'Umbrales', '4xx', '5xx'), [
-            (domain, str(len(signals(result))) if result['total'] else 'Sin accesos de la fecha',
-             result.get('http4', 0), result.get('http5', 0)) for domain, result in sorted(rows, key=review_key)[:100]])
-        footer += '<p>Se muestran hasta 100 dominios en este resumen.</p></section></body></html>'
+        footer += '<h3>DOMINIOS QUE REQUIEREN ATENCIÓN</h3><p>Prioridad: salud web, impacto potencial y tráfico sospechoso; después número de 5xx. Hechos, hipótesis y pasos de revisión en el apartado de cada dominio.</p>'
+        attention = sorted((r for r in rows if (r[1].get('diagnosis') or diagnose_domain(r[1]))['attention']), key=diagnosis_key)
+        footer += html_table(ATTENTION_HEADERS, [attention_values(*row) for row in attention[:100]])
+        if not attention:
+            footer += '<p>Sin condiciones activadas en la lectura; no descarta problemas ni falta de datos.</p>'
+        shared = getattr(self.args, 'shared', None)
+        if shared and shared.findings():
+            footer += '<h3>POSIBLE INCIDENCIA COMPARTIDA DEL SERVIDOR</h3>' + html_table(
+                ('Minuto', 'Hecho observado', 'Dominios'), shared.findings())
+            footer += '<p>Hipótesis para investigar servicios comunes; no demuestra un aumento ni una causa compartida. Solo dominios de esta ejecución/servidor.</p>'
+        if shared and shared.partial:
+            footer += '<p>Correlación parcial por límites: 2048 minutos, 8 dominios/grupo.</p>'
+        footer += '<p>Hasta 100 dominios destacados y 20 coincidencias; muestras pueden ocultar problemas. No atribuye CPU/RAM.</p></section></body></html>'
         self.write(footer, closing=True)
         self.stream.close()
         self.finished = True
@@ -1195,6 +1574,7 @@ def finish_audit(args, rows):
 
 def collect_ranked(root, domains, day, zone, args):
     rows = []
+    args.shared = SharedIncidents(getattr(args, 'thresholds', THRESHOLDS))
     print('\nUna fila por dominio. Peticiones/porcentajes se refieren a los accesos leídos del período.')
     print('MiB = contenido enviado; HUM. = humano probable; DESC. = desconocido; 4xx/5xx = número de respuestas.')
     print('ESTADO: REV:n = umbrales activados; M = muestra, no total diario; A = avisos; SIN FECHA = sin accesos de la fecha.')
@@ -1216,6 +1596,7 @@ def collect_ranked(root, domains, day, zone, args):
             overview_progress(f'[{number}/{len(domains)}] Leyendo {domain}…')
             result = analyze(root, domain, day, zone, args)
             overview_progress()
+            args.shared.add(domain, result)
             if getattr(args, 'audit', None):
                 args.audit.append(domain, result)
             summary = compact_summary(result)
@@ -1237,7 +1618,9 @@ def collect_ranked(root, domains, day, zone, args):
 
 
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(description='Audithor — steev anderson. Filas progresivas y tabla final por peticiones descendentes.')
+    parser = argparse.ArgumentParser(description='Audithor — steev anderson. Filas progresivas, tabla final por tráfico y diagnóstico de salud/impacto potencial.',
+                                     epilog='Diagnóstico basado en lo leído, sin atribuir CPU/RAM. Umbrales: ' +
+                                     ', '.join(f'{key}={value:g}' for key, value in THRESHOLDS.items()))
     parser.add_argument('--version', action='version', version='Audithor ' + VERSION)
     parser.add_argument('domain', nargs='?', help='Dominio exacto para informe detallado')
     dates = parser.add_mutually_exclusive_group()
@@ -1254,12 +1637,41 @@ def arguments(argv=None):
     parser.add_argument('--max-mib', type=int, default=8, help='MiB descomprimidos por dominio; por tanda con --full (1–1024)')
     parser.add_argument('--once', action='store_true', help=f'Analizar únicamente la primera tanda de {PAGE_SIZE} dominios')
     parser.add_argument('--diagnose', action='store_true', help='Mostrar carga, CPU lógicas y memoria; sin analizar dominios')
+    parser.add_argument('--resources', action='store_true', help='Solo instantánea ACTUAL de carga, memoria, PSI, OOM acumulado y procesos; sin logs históricos')
+    parser.add_argument('--threshold', action='append', default=[], metavar='NOMBRE=VALOR',
+                        help='Ajustar un umbral de diagnóstico; repetible. Valores predeterminados al final de esta ayuda')
     parser.add_argument('--inspect-logs', action='store_true', help='Con un dominio, mostrar archivos y fechas de extractos pequeños, sin tráfico privado')
     parser.add_argument('--gentle', action='store_true', help='Reduce los objetivos de CPU y lectura del propio proceso')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--full', action='store_true', help='Recorrer todos los históricos; puede tardar mucho y esperar por carga')
     modes.add_argument('--sample', action='store_true', help='Vista rápida limitada (ya es el modo predeterminado)')
     args = parser.parse_args(argv)
+    args.thresholds = THRESHOLDS.copy()
+    for value in args.threshold:
+        try:
+            name, raw = value.split('=', 1)
+            number = float(raw)
+            if name not in THRESHOLDS or not math.isfinite(number) or number <= 0:
+                raise ValueError
+            if name.endswith('_pct'):
+                if number > 100:
+                    raise ValueError
+            elif name == 'slow_seconds':
+                if number > 600:
+                    raise ValueError
+            elif number != int(number) or number > 1000000:
+                raise ValueError
+            if name == 'sustained_minutes' and number > 60:
+                raise ValueError
+            if name == 'shared_domains' and not 2 <= number <= 8:
+                raise ValueError
+            args.thresholds[name] = number
+        except ValueError:
+            parser.error('Umbral no válido: usa un nombre de la ayuda y un valor positivo finito dentro de rango.')
+    t = args.thresholds
+    if (t['health_critical_count'] < t['health_review_count'] or t['health_critical_pct'] < t['health_review_pct'] or
+            t['sensitive_high'] < t['sensitive_review']):
+        parser.error('Los umbrales críticos/altos no pueden ser menores que los de revisión.')
     args.sample = not args.full
     if args.inspect_logs and not args.domain:
         parser.error('--inspect-logs requiere indicar un dominio.')
@@ -1288,6 +1700,11 @@ def arguments(argv=None):
 
 def main(argv=None):
     args = arguments(argv)
+    if getattr(args, 'resources', False):
+        if not hasattr(os, 'O_NOFOLLOW'):
+            raise RuntimeError('--resources requiere Linux.')
+        show_current_resources()
+        return 0
     if args.diagnose:
         cpus, loads, available = status = host_status()
         print(BANNER)
@@ -1311,12 +1728,17 @@ def main(argv=None):
         raise RuntimeError('No se pudieron aplicar los límites locales: ' + str(exc))
     print(BANNER)
     print('Audithor ' + VERSION)
+    args.server_label = clean(os.uname().nodename, 120)
+    print('Servidor de esta ejecución: ' + args.server_label)
     print(f'Período: {args.period_label} ({args.timezone}). Secuencial; memoria virtual máxima 128 MiB.')
     print(f'Tandas de {args.seconds}s/{args.max_mib} MiB. ' + ('MUESTRA limitada por dominio.' if args.sample else 'LECTURA CONTINUA: descansa y continúa hasta finalizar los archivos seleccionados.'))
     print('Logs en solo lectura. Sin instalaciones, cron ni cambios en Plesk, servicios o permisos de las webs.')
     if args.report:
         print('Modo auditoría: todos los dominios seleccionados, sin esperar start; HTML privado en reports/.')
     print('Bots y humanos son estimaciones. Las señales no confirman ataques.')
+    print('Diagnóstico: salud, tráfico sospechoso e impacto potencial; sin atribución de CPU/RAM.')
+    if args.threshold:
+        print('Umbrales personalizados: ' + ', '.join(args.threshold))
     if args.historical:
         print('Fecha histórica: gzip incluido automáticamente; prioridad a logs rotados.')
     if args.gentle:
@@ -1365,6 +1787,7 @@ def main(argv=None):
                 break
             if input(f'\nEnter: siguientes {PAGE_SIZE} | q + Enter: salir > ').strip().lower() in ('q', 'salir'):
                 break
+        show_attention(rows, args.shared)
     finally:
         if args.audit:
             args.audit.close()
