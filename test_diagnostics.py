@@ -200,7 +200,7 @@ class DiagnosisTests(unittest.TestCase):
 
     def test_optional_resources_never_opens_domain_logs(self):
         args = type('Args', (), dict(resources=True))()
-        with patch.object(a, 'arguments', return_value=args), patch.object(a.os, 'O_NOFOLLOW', 0, create=True), patch.object(a, 'show_current_resources') as show, patch.object(a, 'directory') as logs:
+        with patch.object(a, 'RunGuard'), patch.object(a, 'arguments', return_value=args), patch.object(a.os, 'O_NOFOLLOW', 0, create=True), patch.object(a, 'show_current_resources') as show, patch.object(a, 'directory') as logs:
             self.assertEqual(a.main([]), 0)
             show.assert_called_once()
             logs.assert_not_called()

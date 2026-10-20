@@ -183,7 +183,7 @@ class Tests(unittest.TestCase):
     def test_diagnose_works_even_if_load_is_high(self):
         args = type('Args', (), {'diagnose': True, 'gentle': False})()
         output = io.StringIO()
-        with patch.object(a, 'arguments', return_value=args), patch.object(a, 'host_status', return_value=(8, (9, 6, 5), 1024)), patch.object(a, 'directory') as directory, contextlib.redirect_stdout(output):
+        with patch.object(a, 'RunGuard'), patch.object(a, 'arguments', return_value=args), patch.object(a, 'host_status', return_value=(8, (9, 6, 5), 1024)), patch.object(a, 'directory') as directory, contextlib.redirect_stdout(output):
             self.assertEqual(a.main([]), 0)
             directory.assert_not_called()
         self.assertIn('8.00', output.getvalue())

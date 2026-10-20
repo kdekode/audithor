@@ -16,6 +16,12 @@ import html
 import secrets
 import math
 import textwrap
+import hashlib
+import io
+import signal
+import subprocess
+import selectors
+import types
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -30,7 +36,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.10.0'
+VERSION = '0.12.0'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -38,6 +44,7 @@ BOT = re.compile(r'bot|crawler|spider|slurp|bingpreview', re.I)
 AUTO = re.compile(r'curl|wget|python|sqlmap|nikto|go-http-client|headless|selenium', re.I)
 BROWSER = re.compile(r'Mozilla/5\.0.*(?:Firefox/|Chrome/|Safari/|Edg/)', re.I)
 SENSITIVE = re.compile(r'(?:^|/)(?:\.env|\.git|wp-login\.php|xmlrpc\.php|phpmyadmin)(?:[/.]|$)', re.I)
+EXPOSURE = re.compile(r'(?:^|/)(?:\.env(?:[./]|$)|\.git(?:/|$)|wp-config\.php(?:[.~]|$)|(?:backup|database)\.(?:sql|zip)(?:$|/))', re.I)
 BAN = re.compile(r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?\s+fail2ban\.actions\s+(?:\[\d+\])?:?\s+[A-Z]+\s+\[([^\]]{1,120})\]\s+Ban\s+(\S+)\s*$')
 
 
@@ -68,19 +75,25 @@ def parse_stamp(raw, zone):
                        tzinfo=dt.timezone(delta)).astimezone(zone)
 
 
+def normalized_ip(value):
+    address = ipaddress.ip_address(value)
+    return str(getattr(address, 'ipv4_mapped', None) or address)
+
+
 def parse(line, zone):
     m = ACCESS.match(line)
     if not m:
         return None
     try:
-        ipaddress.ip_address(m[1].decode('ascii'))
+        ip = normalized_ip(m[1].decode('ascii'))
         stamp = parse_stamp(m[2], zone)
         path = safe_path(m[4].decode('utf-8', 'replace'))
         ua = m[7].decode('utf-8', 'replace')[:512]
+        # "probable" se conserva como clave interna para compatibilidad; solo apariencia.
         kind = ('bot' if BOT.search(ua) or AUTO.search(ua) else
-                'probable' if BROWSER.search(ua) and not SENSITIVE.search(path) else 'unknown')
+                'probable' if BROWSER.search(ua) else 'unknown')
         return (stamp.date(), path, int(m[5]), int(m[6]) if m[6] != b'-' else 0, kind,
-                str(ipaddress.ip_address(m[1].decode('ascii'))), stamp.strftime('%Y-%m-%d %H:%M %z'))
+                ip, stamp.strftime('%Y-%m-%d %H:%M %z'))
     except (ValueError, KeyError, UnicodeError, OverflowError):
         return None
 
@@ -112,7 +125,7 @@ def regular(parent, name):
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError('Se rechazó un archivo no regular.')
-        stream = os.fdopen(fd, 'rb', buffering=8192)
+        stream = io.BufferedReader(MeteredRaw(fd), buffer_size=8192) if RUN_GUARD else os.fdopen(fd, 'rb', buffering=8192)
     except BaseException:
         os.close(fd)
         raise
@@ -172,11 +185,13 @@ def discover(root):
     return [name for name, _ in sorted(rows, key=lambda r: (-r[1], r[0]))]
 
 
-def wait_for_capacity(gentle=False):
+def wait_for_capacity(gentle=False, deadline=None):
     """Esperar conservando el estado en memoria; no aumentar los umbrales."""
     announced = False
     next_notice = 0
     while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError('Espera por carga agotada; lectura parcial.')
         reason = pressure(gentle)
         if not reason:
             if announced:
@@ -187,6 +202,388 @@ def wait_for_capacity(gentle=False):
             next_notice = time.monotonic() + 30
             announced = True
         time.sleep(5)
+
+
+class SafetyLimit(BaseException):
+    """No debe ser absorbido por la recuperación normal de archivos/logs."""
+    pass
+
+
+RUN_GUARD = None
+
+
+class RunGuard:
+    """Linux: flock, RLIMIT_AS/CPU y temporizador real. Solo recursos propios."""
+    def __init__(self, args, lock_path='/tmp/audithor.lock'):
+        self.args = args
+        self.lock_path = lock_path
+        self.read = 0
+        self.raw_read = 0
+        self.maximum = args.run_mib * 1048576
+        self.lock_fd = None
+        self.old_handlers = {}
+
+    def __enter__(self):
+        global RUN_GUARD
+        if not sys.platform.startswith('linux'):
+            raise RuntimeError('La ejecución protegida de Audithor requiere Linux; no se inicia sin flock/RLIMIT/señales.')
+        import fcntl
+        import resource
+        try:
+            fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            self.lock_fd = fd
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) & 0o077:
+                raise SafetyLimit('Bloqueo inseguro o de otro usuario en /tmp/audithor.lock; no se modifica.')
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SafetyLimit('Ya hay otra ejecución de Audithor; no se ha iniciado el análisis.')
+            os.nice(19)
+            for kind, maximum in ((resource.RLIMIT_AS, 128 * 1048576),
+                                  (resource.RLIMIT_CPU, math.ceil(time.process_time()) + args.cpu_seconds)):
+                soft, hard = resource.getrlimit(kind)
+                cap = min(maximum, hard) if hard != resource.RLIM_INFINITY else maximum
+                if soft != resource.RLIM_INFINITY:
+                    cap = min(cap, soft)
+                if kind == resource.RLIMIT_CPU:
+                    hard = min(cap + 1, hard) if hard != resource.RLIM_INFINITY else cap + 1
+                resource.setrlimit(kind, (cap, hard))
+            def stop(signum, frame):
+                raise SafetyLimit('Límite efectivo de tiempo/CPU alcanzado; auditoría interrumpida y parcial.')
+            for sig in (signal.SIGALRM, signal.SIGXCPU):
+                self.old_handlers[sig] = signal.signal(sig, stop)
+            signal.setitimer(signal.ITIMER_REAL, args.run_seconds)
+            RUN_GUARD = self
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def debit(self, size, raw=False):
+        key = 'raw_read' if raw else 'read'
+        value = getattr(self, key) + size
+        if value > self.maximum:
+            raise SafetyLimit('Límite total de lectura alcanzado; no se continúa.')
+        setattr(self, key, value)
+
+    def allowance(self, requested, raw=False):
+        left = self.maximum - (self.raw_read if raw else self.read)
+        if left <= 0:
+            raise SafetyLimit('Límite total de lectura alcanzado; auditoría parcial.')
+        return min(requested, left)
+
+    def __exit__(self, *unused):
+        global RUN_GUARD
+        if RUN_GUARD is self:
+            RUN_GUARD = None
+        if self.old_handlers:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            for sig, handler in self.old_handlers.items():
+                signal.signal(sig, handler)
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
+        # No borrar el archivo: unlink permitiría dos bloqueos sobre inodes distintos.
+
+
+class MeteredRaw(io.RawIOBase):
+    """Limita también bytes comprimidos leídos, antes del buffer/gzip."""
+    def __init__(self, fd):
+        super().__init__()
+        self.fd = fd
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def fileno(self):
+        return self.fd
+
+    def tell(self):
+        return os.lseek(self.fd, 0, os.SEEK_CUR)
+
+    def seek(self, offset, whence=0):
+        return os.lseek(self.fd, offset, whence)
+
+    def readinto(self, target):
+        cap = RUN_GUARD.allowance(len(target), raw=True) if RUN_GUARD else len(target)
+        data = os.read(self.fd, cap)
+        if RUN_GUARD:
+            RUN_GUARD.debit(len(data), raw=True)
+        target[:len(data)] = data
+        return len(data)
+
+    def close(self):
+        if not self.closed:
+            os.close(self.fd)
+        super().close()
+
+
+class UniqueIPs:
+    """Exacto hasta 1024 direcciones; después HLL fijo de 2048 registros."""
+    def __init__(self):
+        self.exact = set()
+        self.registers = bytearray(2048)
+        self.salt = secrets.token_bytes(16)
+
+    def add(self, ip):
+        if self.exact is not None and ip in self.exact:
+            return
+        value = hashlib.blake2b(ip.encode('ascii'), digest_size=8, key=self.salt).digest()
+        number = int.from_bytes(value, 'big')
+        index, rest = number >> 53, number & ((1 << 53) - 1)
+        self.registers[index] = max(self.registers[index], 54 - rest.bit_length())
+        if self.exact is not None:
+            self.exact.add(ip)
+            if len(self.exact) > 1024:
+                self.exact = None
+
+    def result(self):
+        if self.exact is not None:
+            return len(self.exact), False
+        m = len(self.registers)
+        raw = .7213 / (1 + 1.079 / m) * m * m / sum(2.0 ** -v for v in self.registers)
+        zeros = self.registers.count(0)
+        if raw <= 2.5 * m and zeros:
+            raw = m * math.log(m / zeros)
+        return round(raw), True
+
+
+class Behavior:
+    """Primeras 1024 IP, 32 rutas y 64 minutos/IP; sin porcentajes de humanidad."""
+    def __init__(self):
+        self.ips = {}
+        self.partial = False
+
+    def add(self, ip, path, status, minute, kind, sensitive):
+        if ip not in self.ips:
+            if len(self.ips) >= 1024:
+                self.partial = True
+                return
+            self.ips[ip] = dict(total=0, bot=0, browser=0, sensitive=0, errors=0,
+                                streak=0, max_streak=0, last=None, paths={}, minutes={})
+        row = self.ips[ip]
+        row['total'] += 1
+        row['bot'] += int(kind == 'bot')
+        row['browser'] += int(kind == 'probable')
+        row['sensitive'] += int(sensitive)
+        row['errors'] += int(status in (403, 404))
+        # Racha solo dentro de un minuto y en orden observado, no secuencia global de red.
+        row['streak'] = row['streak'] + 1 if status in (403, 404) and row['last'] == minute else int(status in (403, 404))
+        row['last'] = minute
+        row['max_streak'] = max(row['max_streak'], row['streak'])
+        for key, limit, value in (('paths', 32, path), ('minutes', 64, minute)):
+            counter = row[key]
+            if value in counter or len(counter) < limit:
+                counter[value] = counter.get(value, 0) + 1
+            else:
+                self.partial = True
+
+    def findings(self):
+        out = []
+        for ip, row in self.ips.items():
+            peak = max(row['minutes'].values(), default=0)
+            repeated = max(row['paths'].values(), default=0)
+            reasons = []
+            if row['sensitive'] >= 20 and row['errors'] >= 10:
+                reasons.append(f'{row["sensitive"]} accesos sensibles y {row["errors"]} respuestas 403/404')
+            if peak >= 120 and repeated >= 50:
+                reasons.append(f'ráfaga {peak}/min y al menos {repeated} repeticiones de una ruta')
+            if row['max_streak'] >= 20 and len(row['paths']) >= 10:
+                reasons.append(f'racha de {row["max_streak"]} rechazos en un minuto; al menos {len(row["paths"])} rutas')
+            if reasons:
+                out.append(dict(ip=ip, requests=row['total'], browser=row['browser'], bot=row['bot'],
+                                peak=peak, reasons='; '.join(reasons)))
+        return sorted(out, key=lambda r: (-r['browser'], -r['peak'], r['ip']))
+
+
+# Lista oficial verificada el 2026-10-20: https://www.cloudflare.com/ips/
+# Nunca se actualiza por red durante una auditoría. Una ausencia no descarta proxy/CDN.
+CF_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '104.16.0.0/13', '104.24.0.0/14',
+    '108.162.192.0/18', '131.0.72.0/22', '141.101.64.0/18', '162.158.0.0/15', '172.64.0.0/13',
+    '173.245.48.0/20', '188.114.96.0/20', '190.93.240.0/20', '197.234.240.0/22', '198.41.128.0/17',
+    '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32',
+    '2a06:98c0::/29', '2c0f:f248::/32'))
+
+
+def cloudflare_ip(value):
+    try:
+        address = ipaddress.ip_address(value)
+        if getattr(address, 'ipv4_mapped', None):
+            address = address.ipv4_mapped
+        return any(address.version == net.version and address in net for net in CF_NETWORKS)
+    except ValueError:
+        return False
+
+
+def ip_label(ip):
+    return ip + (' [red Cloudflare]' if cloudflare_ip(ip) else '')
+
+
+def readonly_f2b_status(jail=None, timeout=1):
+    """Única orden permitida: status. Salida y tiempo limitados, sin shell."""
+    if jail is not None and not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}', jail):
+        raise ValueError('Nombre de jail no válido.')
+    executable = '/usr/bin/fail2ban-client'
+    parent = directory('/usr/bin')
+    try:
+        with regular(parent, 'fail2ban-client') as file:
+            info = os.fstat(file.fileno())
+            if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+                raise ValueError('Cliente Fail2Ban no confiable.')
+    finally:
+        os.close(parent)
+    command = [executable, 'status'] + ([jail] if jail else [])
+    def child_limits():
+        import resource
+        resource.setrlimit(resource.RLIMIT_CPU, (1, 1))
+        # El cliente instalado puede necesitar más espacio virtual que un lector simple.
+        resource.setrlimit(resource.RLIMIT_AS, (64 * 1048576, 64 * 1048576))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, shell=False, close_fds=True,
+                               env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'PYTHONDONTWRITEBYTECODE': '1',
+                                    'PYTHONSAFEPATH': '1', 'PYTHONNOUSERSITE': '1'},
+                               start_new_session=True, preexec_fn=child_limits)
+    end = time.monotonic() + max(.01, timeout)
+    data = bytearray()
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while time.monotonic() < end:
+                if not selector.select(max(0, end - time.monotonic())):
+                    break
+                cap = min(8192, 65536 - len(data))
+                if cap <= 0:
+                    raise ValueError('Salida Fail2Ban demasiado grande; estado parcial.')
+                if RUN_GUARD:
+                    cap = min(RUN_GUARD.allowance(cap), RUN_GUARD.allowance(cap, raw=True))
+                chunk = os.read(process.stdout.fileno(), cap)
+                if RUN_GUARD:
+                    RUN_GUARD.debit(len(chunk))
+                    RUN_GUARD.debit(len(chunk), raw=True)
+                if not chunk:
+                    process.wait(timeout=max(.01, end - time.monotonic()))
+                    if process.returncode:
+                        raise ValueError('Fail2Ban no disponible o sin permisos para consultar status.')
+                    return data.decode('utf-8', 'replace')
+                data.extend(chunk)
+        raise ValueError('Tiempo de consulta Fail2Ban agotado.')
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=2)
+        process.stdout.close()
+
+
+def read_active_fail2ban():
+    result = dict(jails=[], ips=set(), notes=[], at=dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'))
+    deadline = time.monotonic() + 3
+    try:
+        status = readonly_f2b_status(timeout=min(1, max(.01, deadline - time.monotonic())))
+        match = re.search(r'Jail list:\s*([^\n]*)', status)
+        if not match:
+            raise ValueError('No se pudo interpretar el inventario de jails.')
+        jails = [n.strip() for n in match[1].split(',') if n.strip()]
+        if len(jails) > 32:
+            result['notes'].append('Estado parcial: máximo 32 jails.')
+        for jail in jails[:32]:
+            if time.monotonic() >= deadline:
+                raise ValueError('Estado parcial por límite total de 3 s.')
+            try:
+                data = readonly_f2b_status(jail, timeout=min(.5, deadline - time.monotonic()))
+                ips = re.search(r'IP list:\s*([^\n]*)', data)
+                count = re.search(r'Currently banned:[ \t]*(\d{1,10})\b', data)
+                if not ips or not count:
+                    raise ValueError('Formato status no reconocido para ' + clean(jail))
+                observed = []
+                parsed = 0
+                for raw in ips[1].split():
+                    ip = normalized_ip(raw)
+                    if len(result['ips']) >= 5000:
+                        result['notes'].append('Estado parcial: máximo 5000 IP únicas.')
+                        break
+                    result['ips'].add(ip)
+                    parsed += 1
+                    if len(observed) < 20:
+                        observed.append(ip_label(ip))
+                result['jails'].append((jail, int(count[1]), ', '.join(observed) or 'ninguna'))
+                if parsed != int(count[1]):
+                    result['notes'].append('Listado parcial o cambiante en ' + clean(jail) + ': IP recibidas y contador actual no coinciden.')
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                result['notes'].append(clean(str(exc)))
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        result['notes'].append(clean(str(exc)))
+    return result
+
+
+def show_active_fail2ban(result):
+    print('\nFAIL2BAN ACTIVO AHORA · ' + result['at'])
+    table(('JAIL', 'BLOQUEADAS', 'HASTA 20 IP OBSERVADAS'), result['jails'], (26, 12, 70))
+    print('  Estado actual, independiente del historial solicitado; no prueba quién causó el bloqueo.')
+    print('  Etiqueta Cloudflare según lista oficial incluida (2026-10-20); posible proxy compartido, no atacante identificado.')
+    for note in result['notes']:
+        print('  N/D o parcial: ' + note)
+
+
+def sensitive_rows(result):
+    rows = []
+    notfound = result.get('notfound_sizes', {})
+    for path, value in result.get('sensitive_details', {}).items():
+        codes = value['codes']
+        exposure = bool(EXPOSURE.search(path) and codes.get(200))
+        same_size = any(size in notfound for size in value['sizes'])
+        note = ('POSIBLE EXPOSICIÓN; 200 no verificado' if exposure else 'Revisar contexto de la ruta')
+        if exposure and same_size:
+            note += '; tamaño coincide con 404, posible error personalizado'
+        ips = ', '.join(ip_label(ip) + ':' + str(n) for ip, n in sorted(value['ips'].items(), key=lambda x: -x[1])[:5])
+        rows.append((path, sum(codes.values()), codes.get(200, 0), codes.get(401, 0), codes.get(403, 0),
+                     codes.get(404, 0), sum(n for c, n in codes.items() if c not in (200, 401, 403, 404)), ips, note))
+    return sorted(rows, key=lambda r: (not bool(EXPOSURE.search(r[0]) and r[2]), -r[1], r[0]))
+
+
+def coverage_text(result):
+    days = result.get('observed_days', 0)
+    return (f'Cobertura del período: DESCONOCIDA. Accesos observados en {days}/{result.get("period_days", 1)} fechas '
+            f'y {len(result.get("minutes", {}))} minutos; no representa porcentaje de peticiones ni tiempo completamente cubierto.')
+
+
+def unique_text(value):
+    if value is None:
+        return 'N/D'
+    count, approx = value
+    return ('~' if approx else '') + f'{count:,}'
+
+
+def observation_rows(result):
+    uniques = result.get('unique_ips') or {}
+    return [('IP distintas observadas', unique_text(uniques.get('all'))),
+            ('IP con automatización declarada', unique_text(uniques.get('bot'))),
+            ('IP con navegador aparente', unique_text(uniques.get('probable'))),
+            ('IP con tráfico no identificado', unique_text(uniques.get('unknown'))),
+            ('Solicitudes de automatización declarada', str(result.get('counts', {}).get('bot', 0))),
+            ('Peticiones de IP con señales (no declaradas)', str(result.get('suspect_requests', 'N/D'))),
+            ('Solicitudes restantes indeterminadas', str(result.get('indeterminate_requests', 'N/D')))]
+
+
+def show_observation_detail(result):
+    print('\n  IP Y COMPORTAMIENTO · lo observado, sin visitantes ni probabilidades')
+    table(('MEDIDA', 'RESULTADO'), observation_rows(result), (44, 25))
+    print('  IP compartidas pueden incluir muchas personas; las categorías de IP se solapan y no se suman.')
+    print('  ~ = HLL aproximado, error típico ~2,3%, sin garantía individual; exacto solo en la lectura hasta 1024 IP.')
+    print('  Comportamiento: primeras 1024 IP; como máximo 20 hallazgos mostrados.')
+    print('  ' + result.get('coverage', coverage_text(result)))
+    table(('IP', 'PETICIONES', 'NAV.', 'PICO/MIN', 'SEÑALES'),
+          [(ip_label(r['ip']), r['requests'], r['browser'], r['peak'], r['reasons']) for r in result.get('behavior', [])], (36, 10, 7, 9, 70))
+    print('\n  Rutas sensibles · posibles exposiciones primero; 200 no verificado')
+    table(('RUTA', 'TOTAL', '200', '401', '403', '404', 'OTROS', 'IP (CONTEO PARCIAL)', 'REVISIÓN'),
+          sensitive_rows(result), (30, 7, 6, 6, 6, 6, 7, 38, 58))
+    print('  Primeras 8 IP por ruta y hasta 64 rutas; el top de IP es parcial si se supera el límite.')
+    print('  Coincidir en tamaño con un 404 solo sugiere un error personalizado; no verifica el contenido.')
 
 
 class Budget:
@@ -209,15 +606,20 @@ class Budget:
         self.wall_mark = self.started
         self.high_load = False
         self.checked_step = -1
+        self.hard_end = self.started + max(30, seconds)
+        self.hard_maximum = max(64 * 1048576, self.maximum)
 
     def exhausted(self):
         if self.continuous:
+            if self.read >= self.hard_maximum or time.monotonic() >= self.hard_end:
+                self.pressure = 'Límite total del dominio alcanzado.'
+                return True
             if self.steps % 100 == 0:
-                wait_for_capacity(self.gentle)
+                wait_for_capacity(self.gentle, self.hard_end)
             if self.read >= self.maximum or time.monotonic() >= self.end:
                 print(f'  Progreso: {self.read/1048576:.2f} MiB leídos; {self.steps:,} líneas/fragmentos. Continúo…', flush=True)
                 time.sleep(1)
-                wait_for_capacity(self.gentle)
+                wait_for_capacity(self.gentle, self.hard_end)
                 self.end = time.monotonic() + self.window_seconds
                 self.maximum = self.read + self.window_bytes
             return False
@@ -233,6 +635,8 @@ class Budget:
         return self.read >= self.maximum or time.monotonic() >= self.end
 
     def tick(self, size):
+        if RUN_GUARD:
+            RUN_GUARD.debit(size)
         self.read += size
         self.steps += 1
         # Limitar trabajo por bloques, no dormir 10 ms en cada línea.
@@ -250,8 +654,11 @@ class Budget:
 
 
 def host_status():
-    with open('/proc/meminfo', 'r', encoding='ascii') as stream:
-        info = stream.read(8192)
+    with open('/proc/meminfo', 'rb', buffering=0) as stream:
+        data = stream.read(RUN_GUARD.allowance(8192, raw=True) if RUN_GUARD else 8192)
+    if RUN_GUARD:
+        RUN_GUARD.debit(len(data), raw=True)
+    info = data.decode('ascii')
     available = re.search(r'^MemAvailable:\s+(\d+) kB$', info, re.M)
     if not available:
         raise ValueError('MemAvailable no está disponible.')
@@ -262,6 +669,8 @@ def pressure_reason(status, gentle=False, rapid=False):
     cpus, loads, available = status
     factor = LOAD_PER_CPU
     limit = cpus * factor
+    if rapid and loads[0] > max(4, cpus * 2):
+        return f'Carga extrema del host: {loads[0]:.2f}; umbral de parada rápida: {max(4, cpus * 2):g}. Análisis aplazado.'
     if loads[0] > limit and not rapid:
         return (f'Carga media 1 min: {loads[0]:.2f}; umbral: {limit:.2f} '
                 f'({cpus} CPU lógicas × {factor:g}). Análisis aplazado. Usa --diagnose para ver el estado.')
@@ -336,8 +745,10 @@ def scan(parent, name, budget, state):
                 remaining = initial.st_size - raw.tell() if not packed else 16384
                 if remaining <= 0:
                     break
-                allowance = 16384 if budget.continuous else budget.maximum - budget.read
+                allowance = min(budget.maximum, budget.hard_maximum) - budget.read
                 cap = min(16384, remaining, allowance)
+                if RUN_GUARD:
+                    cap = RUN_GUARD.allowance(cap)
                 line = stream.readline(cap)
                 if not line:
                     break
@@ -346,7 +757,9 @@ def scan(parent, name, budget, state):
                     state['notes'].add('Línea larga/incompleta o límite de lectura; cobertura parcial.')
                     # No analizar fragmentos como si fuesen peticiones completas.
                     while line and not line.endswith(b'\n') and not budget.exhausted():
-                        cap = 16384 if budget.continuous else min(16384, budget.maximum - budget.read)
+                        cap = min(16384, min(budget.maximum, budget.hard_maximum) - budget.read)
+                        if RUN_GUARD:
+                            cap = RUN_GUARD.allowance(cap)
                         line = stream.readline(cap)
                         budget.tick(len(line))
                     continue
@@ -401,7 +814,7 @@ def parse_ban(line):
     if not match:
         return None
     try:
-        return dt.date.fromisoformat(text[:10]), clean(match[1], 80), str(ipaddress.ip_address(match[2]))
+        return dt.date.fromisoformat(text[:10]), clean(match[1], 80), normalized_ip(match[2])
     except ValueError:
         return None
 
@@ -485,13 +898,18 @@ def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1, end
     # Reservar la mayor parte del presupuesto para contar tráfico, no inspeccionarlo.
     probe_limit = min(budget.maximum, budget.read + min(256 * 1024, max(1, (budget.maximum - budget.read) // 8)))
     selected = set()
+    cached_dates = {}
     def dates_in(name):
+        if name in cached_dates:
+            return cached_dates[name]
         if time.monotonic() >= deadline or budget.read >= probe_limit or budget.exhausted():
             return []
         try:
             with regular(parent, name) as raw:
                 size = os.fstat(raw.fileno()).st_size
                 cap = min(8192, probe_limit - budget.read)
+                if RUN_GUARD:
+                    cap = RUN_GUARD.allowance(cap)
                 if name.endswith('.gz'):
                     with gzip.GzipFile(fileobj=raw, mode='rb') as stream:
                         first = stream.read(cap)
@@ -502,7 +920,10 @@ def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1, end
                     last = b''
                     if size > len(first) and budget.read < probe_limit and not budget.exhausted():
                         raw.seek(max(len(first), size - 8192))
-                        last = raw.read(min(8192, probe_limit - budget.read)).split(b'\n', 1)[-1]
+                        last_cap = min(8192, probe_limit - budget.read)
+                        if RUN_GUARD:
+                            last_cap = RUN_GUARD.allowance(last_cap)
+                        last = raw.read(last_cap).split(b'\n', 1)[-1]
                     budget.tick(len(last))
                 if name.endswith('.gz'):
                     budget.tick(len(first))
@@ -513,6 +934,9 @@ def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1, end
         except (OSError, EOFError, ValueError, zlib.error):
             notes.add('No se pudo comprobar la fecha de ' + name)
             return []
+    # Dar prioridad a los textos de ambas familias antes de gastar sondas en gzip.
+    for name in (n for n in files if not n.endswith('.gz')):
+        cached_dates[name] = dates_in(name)
     for base, group in groups.items():
         plain = [n for n in group if not n.endswith('.gz')]
         compatible = []
@@ -524,8 +948,7 @@ def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1, end
                 covers_period = covers_period or (min(dates) <= day and max(dates) >= end_day)
         if compatible:
             selected.update(compatible)
-            if covers_period:
-                continue
+            # El intervalo del texto no demuestra que los gzip no contengan más datos.
         # En gzip solo conocemos el inicio: el más reciente anterior al día es candidato.
         zipped = []
         for name in (n for n in group if n.endswith('.gz')):
@@ -535,9 +958,13 @@ def dated_quick_files(parent, files, day, zone, budget, notes, day_offset=1, end
         if zipped:
             preceding = [date for date, _ in zipped if date <= day]
             latest = max(preceding) if preceding else None
-            selected.update(name for date, name in zipped if day <= date <= end_day or date == latest)
-            notes.add('Candidato gzip elegido por fecha inicial; no se ha verificado su fecha final.')
-        else:
+            candidates = [name for date, name in zipped if day <= date <= end_day or (date == latest and not covers_period)]
+            selected.update(candidates)
+            if candidates:
+                notes.add('Candidato gzip elegido por fecha inicial; no se ha verificado su fecha final.')
+            if covers_period:
+                notes.add('Gzip anterior al período no recorrido si el texto cubre su intervalo: puede haber solapamientos no detectados; cobertura desconocida.')
+        elif not compatible:
             selected.update(quick_files(group, True, day_offset, log_basename))
             notes.add('No se confirmó un archivo para la fecha en los extractos; selección provisional.')
     notes.add('Selección por fechas de extractos: un intervalo compatible no garantiza registros de todo el día.')
@@ -648,6 +1075,8 @@ def read_fail2ban(args):
                     result['events'] += 1
                     if ip in result['ips'] or len(result['ips']) < 20000:
                         result['ips'].add(ip)
+                        if cloudflare_ip(ip):
+                            result['notes'].add('Hay IP de redes Cloudflare en el historial: pueden ser proxies compartidos; no identifican al atacante.')
                     else:
                         result['notes'].add('Límite de 20 000 IP Fail2Ban: coincidencias y únicas son parciales.')
                     if jail not in result['jails'] and len(result['jails']) >= 100:
@@ -770,7 +1199,7 @@ def diagnose_domain(result, thresholds=None):
     if not total:
         return dict(health=health, suspicious=suspicious, impact=impact, facts=['Sin accesos del período analizado.'],
                     hypotheses=['No se puede valorar la salud ni el impacto.'], actions=['Revisar fechas, retención y avisos de lectura.'],
-                    confidence='INSUFICIENTE', attention=False, priority=(0, 0, 0), sustained=0)
+                    confidence='INSUFICIENTE', attention=False, priority=(0, 0, 0, 0), sustained=0)
     errors = result.get('http5', 0)
     error_pct = 100 * errors / total
     if total >= t['health_min']:
@@ -798,6 +1227,17 @@ def diagnose_domain(result, thresholds=None):
         hypotheses.append('Posible exploración automatizada; ni los 4xx ni el User-Agent identifican por sí solos un ataque.')
         actions.append('Revisar rutas e IP de errores en Plesk. Si usas Cloudflare, estudiar desafíos limitados a rutas sensibles y tasas por IP antes de aplicar cambios.')
         actions.append('Comprobar intentos repetidos de login/XML-RPC y archivos internos; evitar reglas generales sobre WordPress, WooCommerce o APIs.')
+    behavior = result.get('behavior', [])
+    exposures = [row for row in sensitive_rows(result) if EXPOSURE.search(row[0]) and row[2]]
+    if behavior:
+        suspicious = 'MODERADO' if suspicious == 'BAJO' else suspicious
+        facts.append(f'{result.get("suspect_ip_count", len(behavior))} IP observadas con ráfagas, repeticiones o exploración; cabeceras de navegador no prueban humanidad.')
+        hypotheses.append('Automatización sospechosa, sin probabilidad calculada. NAT, proxies o CDN pueden reunir usuarios legítimos en una IP.')
+        actions.append('Revisar las señales por IP y el proxy de confianza en Plesk; no bloquear por User-Agent ni por IP compartida sin contexto.')
+    if exposures:
+        facts.append(f'{len(exposures)} rutas de posibles archivos internos devolvieron 200 en la muestra.')
+        hypotheses.append('Posible exposición NO CONFIRMADA: un 200 también puede ser una página de error personalizada o un front controller.')
+        actions.append('Prioridad: comprobar en Plesk el archivo y la configuración de la ruta, sin descargar contenido confidencial; comparar con errores personalizados.')
     gateway = sum(result.get('statuses', {}).get(code, 0) for code in (502, 503, 504))
     saturation = sum(result.get('internal', {}).get(label, 0) for label in SATURATION)
     timings = result.get('timing_count', 0)
@@ -834,8 +1274,8 @@ def diagnose_domain(result, thresholds=None):
         actions.append('Cloudflare no corrige fallos internos de aplicación; investigar primero el origen de los 5xx.')
     at_peak = result.get('error_minutes', {}).get(result.get('peak_minute'), (0, 0, 0))
     facts.append(f'Errores en el minuto de mayor tráfico: {at_peak[0]} 4xx y {at_peak[1]} 5xx (coincidencia, no causalidad).')
-    attention = health in ('REVISAR', 'CRÍTICO') or suspicious != 'BAJO' or impact in ('POSIBLE', 'ALTO POTENCIAL')
-    priority = (int(health == 'CRÍTICO') * 2 + int(health == 'REVISAR'),
+    attention = bool(exposures) or health in ('REVISAR', 'CRÍTICO') or suspicious != 'BAJO' or impact in ('POSIBLE', 'ALTO POTENCIAL')
+    priority = (int(bool(exposures)), int(health == 'CRÍTICO') * 2 + int(health == 'REVISAR'),
                 {'NO DETERMINADO': 0, 'BAJO': 0, 'POSIBLE': 1, 'ALTO POTENCIAL': 2}[impact],
                 {'BAJO': 0, 'MODERADO': 1, 'ALTO': 2}[suspicious])
     return dict(health=health, suspicious=suspicious, impact=impact, facts=facts, hypotheses=hypotheses,
@@ -947,7 +1387,10 @@ def current_resources():
             raise ValueError('Límite de instantánea alcanzado.')
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
-            data = os.read(fd, maximum)
+            cap = RUN_GUARD.allowance(maximum, raw=True) if RUN_GUARD else maximum
+            data = os.read(fd, cap)
+            if RUN_GUARD:
+                RUN_GUARD.debit(len(data), raw=True)
             read += len(data)
             return data.decode('ascii', 'replace')
         finally:
@@ -1020,6 +1463,21 @@ def show_current_resources():
 
 
 def analyze(root, domain, day, zone, args):
+    if not RUN_GUARD:
+        return _analyze(root, domain, day, zone, args)
+    # El límite global sigue activo y no se renueva al cambiar de dominio.
+    remaining, interval = signal.getitimer(signal.ITIMER_REAL)
+    local = (max(30, args.seconds) if not args.sample else args.seconds) + 4
+    signal.setitimer(signal.ITIMER_REAL, min(remaining, local) if remaining else local)
+    started = time.monotonic()
+    try:
+        return _analyze(root, domain, day, zone, args)
+    finally:
+        left = remaining - (time.monotonic() - started)
+        signal.setitimer(signal.ITIMER_REAL, max(.001, left) if remaining else 0, interval)
+
+
+def _analyze(root, domain, day, zone, args):
     detailed = bool(args.domain or getattr(args, 'report', False))
     state = dict(inodes=set(), notes=set(), counts=collections.Counter(), urls=collections.Counter(),
                  bytes_urls=collections.Counter(), errors=collections.Counter(), statuses=collections.Counter(),
@@ -1029,6 +1487,10 @@ def analyze(root, domain, day, zone, args):
                  ip_counts=collections.Counter(), minutes=collections.Counter(), sensitive_urls=collections.Counter(),
                  f2b_seen=set(), sensitive=0, sensitive4=0, http4=0, http5=0, peak=0, peak_minute=None,
                  total=0, bytes=0, invalid=0, earliest=None, latest=None)
+    uniques = {kind: UniqueIPs() for kind in ('all', 'bot', 'probable', 'unknown')}
+    behavior = Behavior()
+    days_seen = set()
+    state.update(sensitive_details={}, notfound_sizes=collections.Counter(), behavior_partial=False)
     start_day = getattr(args, 'start_day', day)
     period_days = (day - start_day).days + 1
     state['period_days'] = period_days
@@ -1091,7 +1553,30 @@ def analyze(root, domain, day, zone, args):
                     state['statuses'][status] += 1
                     state['http4'] += int(400 <= status < 500)
                     state['http5'] += int(status >= 500)
-                    probe = bool(SENSITIVE.search(unquote(path)))
+                    probe = bool(SENSITIVE.search(unquote(path)) or EXPOSURE.search(path))
+                    uniques['all'].add(ip)
+                    uniques[kind].add(ip)
+                    days_seen.add(date)
+                    behavior.add(ip, path, status, minute, kind, probe)
+                    if status == 404 and (size in state['notfound_sizes'] or len(state['notfound_sizes']) < 64):
+                        state['notfound_sizes'][size] += 1
+                    if probe:
+                        if path not in state['sensitive_details'] and len(state['sensitive_details']) >= 64:
+                            if status == 200 and EXPOSURE.search(path):
+                                discard = next((p for p, item in state['sensitive_details'].items()
+                                                if not (EXPOSURE.search(p) and item['codes'].get(200))), None)
+                                if discard is not None:
+                                    del state['sensitive_details'][discard]
+                            state['notes'].add('Rutas sensibles parciales: máximo 64 rutas.')
+                        if path in state['sensitive_details'] or len(state['sensitive_details']) < 64:
+                            sensitive = state['sensitive_details'].setdefault(path, dict(codes=collections.Counter(), ips={}, sizes=set()))
+                            sensitive['codes'][status] += 1
+                            if ip in sensitive['ips'] or len(sensitive['ips']) < 8:
+                                sensitive['ips'][ip] = sensitive['ips'].get(ip, 0) + 1
+                            else:
+                                state['notes'].add('IP de rutas sensibles parciales: primeras 8 por ruta; ranking incompleto.')
+                            if status == 200 and len(sensitive['sizes']) < 8:
+                                sensitive['sizes'].add(size)
                     state['sensitive'] += int(probe)
                     state['sensitive4'] += int(probe and 400 <= status < 500)
                     # Un día tiene <=1500 minutos con cambio horario; límite defensivo.
@@ -1163,6 +1648,23 @@ def analyze(root, domain, day, zone, args):
     finally:
         os.close(fd)
     state['read'] = budget.read
+    state['unique_ips'] = {kind: value.result() for kind, value in uniques.items()}
+    state['observed_days'] = len(days_seen)
+    state['coverage'] = coverage_text(state)
+    all_findings = behavior.findings()
+    state['behavior'] = all_findings[:20]
+    state['suspect_ip_count'] = len(all_findings)
+    suspect_ips = {row['ip'] for row in all_findings}
+    # Sin probabilidades: clasificación orientativa y parcial de solicitudes observadas.
+    state['suspect_requests'] = sum(row['total'] - row['bot'] for ip, row in behavior.ips.items() if ip in suspect_ips)
+    state['indeterminate_requests'] = state['total'] - state['counts']['bot'] - state['suspect_requests']
+    state['behavior_partial'] = behavior.partial
+    active = getattr(args, 'active_bans', None)
+    state['active_matches'] = len(set(behavior.ips).intersection(active['ips'])) if active and active['jails'] else None
+    if behavior.partial:
+        state['notes'].add('Comportamiento parcial: primeras 1024 IP, hasta 32 rutas y 64 minutos por IP; no descarta automatización fuera de la muestra.')
+    if any(approx for value, approx in state['unique_ips'].values()):
+        state['notes'].add('IP únicas aproximadas con HLL (2048 registros); error estadístico típico ~2,3%, no cota garantizada.')
     if state['f2b_matches'] is not None:
         state['f2b_matches'] = len(state['f2b_seen']) if state['read'] else None
     if state['invalid']:
@@ -1206,7 +1708,7 @@ def show(domain, day, result, detail=False):
         ('Peticiones del período leídas', f'{total:,}' if known else 'N/D'),
         ('Contenido enviado (según log)', f'{result["bytes"]/1048576:.2f} MiB' if known else 'N/D'),
         ('Bots / automatización probable', pct('bot')),
-        ('Humano probable / desconocido', pct('probable') + ' / ' + pct('unknown')),
+        ('Navegador aparente / no identificado', pct('probable') + ' / ' + pct('unknown')),
         ('Respuestas 4xx (ej. 403 / 404)', count_pct(result.get('http4', 0))),
         ('Respuestas 5xx (ej. 500 / 503)', count_pct(result.get('http5', 0))),
         ('Accesos a rutas sensibles', f'{result.get("sensitive", 0):,}' if total else 'N/D'),
@@ -1248,6 +1750,9 @@ def show(domain, day, result, detail=False):
         for note in sorted(result['notes']):
             print('    - ' + note)
     if detail:
+        show_observation_detail(result)
+        if result.get('active_matches') is not None:
+            print(f'  IP de esta lectura coincidentes con bloqueos ACTIVOS AHORA: {result["active_matches"]} (solo IP rastreadas; no bloqueos del período).')
         show_diagnosis(result.get('diagnosis') or diagnose_domain(result))
         print('\n  Códigos HTTP: porcentaje sobre todas las peticiones leídas del período\n')
         table(('CÓDIGO', 'RESPUESTAS', '% PETICIONES'), http_rows(result), (12, 14, 18))
@@ -1262,7 +1767,7 @@ def show(domain, day, result, detail=False):
                                  ('IP con más peticiones (dirección registrada)', 'ip_counts', 'PETICIONES'),
                                  ('IP con más respuestas de error', 'error_clients', 'ERRORES')]:
             print('\n  ' + title + '\n')
-            rows = [(f'{count:,}', path) for path, count in result.get(key, collections.Counter()).most_common(10)]
+            rows = [(f'{count:,}', ip_label(path) if key in ('ip_counts', 'error_clients') else path) for path, count in result.get(key, collections.Counter()).most_common(10)]
             table((unit, 'RUTA / IP'), rows, (12, 62))
             if not rows:
                 print('  Sin datos observados.')
@@ -1271,6 +1776,11 @@ def show(domain, day, result, detail=False):
         if not result['internal']:
             print('  Sin mensajes interpretados para la fecha; revisa la cobertura.')
         print('\n  Las IP pueden ser proxies/CDN. No se verifica su identidad ni se bloquean.')
+        if 'watch_history' in result:
+            try:
+                watch_module().show_history(result['watch_history'], result.get('watch_zone', dt.timezone.utc), sys.modules[__name__])
+            except (OSError, RuntimeError, ValueError):
+                print('  Incidencias guardadas no disponibles; no implica ausencia de errores.')
     print()
 
 
@@ -1288,6 +1798,8 @@ def compact_summary(result):
     summary['peak_minute'] = result.get('peak_minute')
     summary['f2b_matches'] = result.get('f2b_matches')
     summary['diagnosis'] = result.get('diagnosis') or diagnose_domain(result)
+    for key in ('unique_ips', 'observed_days', 'coverage', 'suspect_requests', 'indeterminate_requests', 'behavior_partial', 'suspect_ip_count'):
+        summary[key] = result.get(key)
     summary['counts'] = collections.Counter({key: result['counts'][key] for key in ('bot', 'probable', 'unknown')})
     notes = sorted(result['notes'])
     summary['notes'] = [clean(note, 240) for note in notes[:8]]
@@ -1310,8 +1822,8 @@ def traffic_key(row):
 
 
 OVERVIEW_COLUMNS = (
-    ('DOMINIO', 32), ('PETICIONES', 10), ('MiB', 9), ('BOTS %', 7),
-    ('HUM. %', 7), ('DESC. %', 7), ('4xx (#)', 7), ('5xx (#)', 7),
+    ('DOMINIO', 32), ('PETICIONES', 10), ('MiB', 9), ('IP ÚNICAS', 10), ('BOTS %', 7),
+    ('NAV. %', 7), ('DESC. %', 7), ('4xx (#)', 7), ('5xx (#)', 7),
     ('PICO/MIN', 8), ('ESTADO', 14),
 )
 
@@ -1350,6 +1862,7 @@ def show_overview_row(domain, result):
         flags.append('A')
     print(overview_line((domain, f'{total:,}' if known and total else 'N/D',
                          f'{result["bytes"]/1048576:.2f}' if known and total else 'N/D',
+                         unique_text((result.get('unique_ips') or {}).get('all')) if total else 'N/D',
                          percent('bot'), percent('probable'), percent('unknown'),
                          f'{result.get("http4", 0):,}' if total else 'N/D',
                          f'{result.get("http5", 0):,}' if total else 'N/D',
@@ -1416,7 +1929,7 @@ def html_section(domain, result, args):
         ('Peticiones observadas', total if result.get('read') else 'N/D'),
         ('Contenido enviado según el log', f'{result["bytes"]/1048576:.2f} MiB'),
         ('Bots / automatización probable', pct(result['counts']['bot'])),
-        ('Humano probable', pct(result['counts']['probable'])),
+        ('Navegador aparente (no humanidad)', pct(result['counts']['probable'])),
         ('Desconocido', pct(result['counts']['unknown'])),
         ('Respuestas 4xx', f'{result.get("http4", 0):,} ({pct(result.get("http4", 0))})'),
         ('Respuestas 5xx', f'{result.get("http5", 0):,} ({pct(result.get("http5", 0))})'),
@@ -1430,6 +1943,14 @@ def html_section(domain, result, args):
         ('Fechas encontradas en los logs', f'{result.get("earliest")} a {result.get("latest")}'),
     ]
     output = '<section><h2>' + esc(domain) + '</h2>' + html_table(('Métrica', 'Resultado'), metrics)
+    output += '<h3>IP únicas y comportamiento</h3>' + html_table(('Medida', 'Valor'), observation_rows(result))
+    output += '<p>' + esc(result.get('coverage', coverage_text(result))) + '</p>'
+    output += '<p>IP no equivale a visitante. Categorías de IP solapadas. ~ = estimación HLL (2048 registros, error típico ~2,3%, no garantizado). Exacto hasta 1024 IP de la lectura. Comportamiento: primeras 1024 IP, 32 rutas/64 minutos por IP; hasta 20 hallazgos. No hay probabilidades de humanidad.</p>'
+    output += html_table(('IP', 'Peticiones', 'Navegador aparente', 'Pico/min', 'Señales'),
+                         [(ip_label(r['ip']), r['requests'], r['browser'], r['peak'], r['reasons']) for r in result.get('behavior', [])])
+    output += '<h3>Rutas sensibles: posibles exposiciones primero</h3>' + html_table(
+        ('Ruta', 'Total', '200', '401', '403', '404', 'Otros', 'IP y conteo', 'Revisión'), sensitive_rows(result))
+    output += '<p>HTTP 200 no verifica contenido: posibles errores personalizados/front controller. No se descarga nada. Hasta 64 rutas y primeras 8 IP por ruta; ranking parcial si se rebasa el límite.</p>'
     d = result.get('diagnosis') or diagnose_domain(result, getattr(args, 'thresholds', THRESHOLDS))
     output += '<h3>Diagnóstico del período leído</h3>' + html_table(
         ('Salud web', 'Tráfico sospechoso', 'Impacto potencial'), [(d['health'], d['suspicious'], d['impact'])])
@@ -1454,8 +1975,13 @@ def html_section(domain, result, args):
         values = result.get(key, collections.Counter())
         output += '<h3>' + esc(title) + '</h3>'
         output += html_table(('Ruta / IP / categoría', 'Valor'), values.most_common(20))
-    output += '<h3>Avisos de lectura</h3><ul>' + ''.join('<li>' + esc(note) + '</li>' for note in sorted(result['notes'])) + '</ul></section>'
-    return output
+    output += '<h3>Avisos de lectura</h3><ul>' + ''.join('<li>' + esc(note) + '</li>' for note in sorted(result['notes'])) + '</ul>'
+    if 'watch_history' in result:
+        try:
+            output += watch_module().history_html(result['watch_history'], args.zone, sys.modules[__name__])
+        except (OSError, RuntimeError, ValueError):
+            output += '<p>Incidencias guardadas no disponibles; no implica ausencia de errores.</p>'
+    return output + '</section>'
 
 
 def create_report_file(day, base=None):
@@ -1505,11 +2031,18 @@ class HtmlAudit:
         self.write('<p>Umbrales de diagnóstico: ' + html.escape(', '.join(f'{k}={v:g}' for k, v in getattr(args, 'thresholds', THRESHOLDS).items())) + '</p>')
         self.write('<p>Informe de logs disponibles. Una petición puede ser una página, imagen, CSS o API; no equivale a una persona. '
                    'Transferencia es el tamaño de respuestas registrado; 4xx son rechazos/no encontrados y 5xx errores del servidor. '
-                   'Los porcentajes usan las peticiones leídas de la fecha. Bots y humanos son estimaciones. '
+                   'Los porcentajes usan las peticiones leídas de la fecha. User-Agent de navegador no demuestra humanidad. '
                    'Un pico no confirma un ataque. Actividad: baja &lt;60/min, moderada 60–599, alta 600–2999, muy alta &gt;=3000; no compara con el historial de cada web. RAM/CPU históricas por dominio no están disponibles. '
                    'Rankings limitados a 2000 valores; se muestran los 20 primeros. Retención, rotación y formatos pueden limitar la cobertura.</p>')
         if args.sample:
             self.write('<p><strong>MODO MUESTRA: cada dominio puede contener solo parte de sus registros.</strong></p>')
+        self.write('<p><strong>Hasta que figure un resumen final de recorrido terminado, considera este informe parcial.</strong></p>')
+        active = getattr(args, 'active_bans', None)
+        if active:
+            self.write('<h2>Fail2Ban ACTIVO AHORA · ' + html.escape(active['at']) + '</h2>' +
+                       html_table(('Jail', 'Actualmente bloqueadas', 'Hasta 20 IP'), active['jails']))
+            self.write('<p>Instantánea actual independiente del período histórico. Cloudflare: lista oficial incluida, verificada 2026-10-20. No se cambian bloqueos.</p><ul>' +
+                       ''.join('<li>' + html.escape(note) + '</li>' for note in active['notes']) + '</ul>')
         bans = getattr(args, 'bans', None)
         if bans:
             figures = ('Eventos Ban observados: ' + str(bans['events']) + ' · IP únicas observadas: ' + str(len(bans['ips']))) if bans['day_seen'] else 'N/D: no se leyeron mensajes para esta fecha'
@@ -1576,7 +2109,7 @@ def collect_ranked(root, domains, day, zone, args):
     rows = []
     args.shared = SharedIncidents(getattr(args, 'thresholds', THRESHOLDS))
     print('\nUna fila por dominio. Peticiones/porcentajes se refieren a los accesos leídos del período.')
-    print('MiB = contenido enviado; HUM. = humano probable; DESC. = desconocido; 4xx/5xx = número de respuestas.')
+    print('MiB = contenido enviado; NAV. = navegador aparente, no humano demostrado; DESC. = sin identificar; 4xx/5xx = respuestas.')
     print('ESTADO: REV:n = umbrales activados; M = muestra, no total diario; A = avisos; SIN FECHA = sin accesos de la fecha.')
     print('BAJA/MODERADA/ALTA = volumen orientativo del pico; no confirma ni descarta ataques.')
     print('Para explicaciones, rutas, IP y avisos completos: ejecuta el comando indicando un dominio.')
@@ -1592,7 +2125,7 @@ def collect_ranked(root, domains, day, zone, args):
                     print(f'\nRecorrido incompleto: {reason}', flush=True)
                     break
             else:
-                wait_for_capacity(args.gentle)
+                wait_for_capacity(args.gentle, time.monotonic() + 30)
             overview_progress(f'[{number}/{len(domains)}] Leyendo {domain}…')
             result = analyze(root, domain, day, zone, args)
             overview_progress()
@@ -1623,6 +2156,8 @@ def arguments(argv=None):
                                      ', '.join(f'{key}={value:g}' for key, value in THRESHOLDS.items()))
     parser.add_argument('--version', action='version', version='Audithor ' + VERSION)
     parser.add_argument('domain', nargs='?', help='Dominio exacto para informe detallado')
+    parser.add_argument('--watch', action='store_true', help='Vigilar manualmente solo eventos nuevos de un dominio; SQLite privado en data/')
+    parser.add_argument('--watch-seconds', type=int, default=900, help='Duración manual máxima de --watch (1–3600 s; también rige --run-seconds)')
     dates = parser.add_mutually_exclusive_group()
     dates.add_argument('--yesterday', action='store_true', help='Ayer en la zona horaria elegida')
     dates.add_argument('--date', help='Fecha YYYY-MM-DD; solo si quedan logs')
@@ -1631,6 +2166,7 @@ def arguments(argv=None):
     parser.add_argument('--root', default='/var/www/vhosts/system', help='Raíz de logs Plesk; no se modifica')
     parser.add_argument('--gzip', action='store_true', help='Incluir históricos comprimidos dentro del mismo presupuesto')
     parser.add_argument('--no-fail2ban', action='store_true', help='Omitir lectura del historial Fail2Ban')
+    parser.add_argument('--fail2ban-active', action='store_true', help='Consultar status actual de jails mediante cliente local; solo lectura, opcional')
     parser.add_argument('--fail2ban-log', default='/var/log/fail2ban.log', help='Archivo de historial Fail2Ban, sin modificarlo')
     parser.add_argument('--report', action='store_true', help='Guardar HTML local de todos los dominios; usa --full para ampliar la lectura')
     parser.add_argument('--seconds', type=int, default=5, help='Segundos por dominio en vista rápida; por tanda con --full (1–1800)')
@@ -1642,10 +2178,23 @@ def arguments(argv=None):
                         help='Ajustar un umbral de diagnóstico; repetible. Valores predeterminados al final de esta ayuda')
     parser.add_argument('--inspect-logs', action='store_true', help='Con un dominio, mostrar archivos y fechas de extractos pequeños, sin tráfico privado')
     parser.add_argument('--gentle', action='store_true', help='Reduce los objetivos de CPU y lectura del propio proceso')
+    parser.add_argument('--allow-long-scan', action='store_true', help='Autorizar límites por dominio mayores de 30 s/64 MiB; nunca elimina los límites globales')
+    parser.add_argument('--run-seconds', type=int, default=900, help='Límite real global, incluidas esperas y pausas interactivas (1–3600; predeterminado 900 s)')
+    parser.add_argument('--cpu-seconds', type=int, default=30, help='Presupuesto CPU del proceso impuesto por kernel (1–120; predeterminado 30 s)')
+    parser.add_argument('--run-mib', type=int, default=256, help='Techo acumulado para lectura bruta y, por separado, descomprimida (1–2048; predeterminado 256 MiB cada una)')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--full', action='store_true', help='Recorrer todos los históricos; puede tardar mucho y esperar por carga')
     modes.add_argument('--sample', action='store_true', help='Vista rápida limitada (ya es el modo predeterminado)')
     args = parser.parse_args(argv)
+    if not 1 <= args.watch_seconds <= 3600:
+        parser.error('--watch-seconds fuera de rango.')
+    if args.watch and (not args.domain or args.full or args.yesterday or args.date or args.week or args.gzip or
+                       args.report or args.diagnose or args.resources or args.inspect_logs or args.fail2ban_active or args.once):
+        parser.error('--watch requiere un solo dominio y no admite históricos, --full, --report, diagnósticos ni Fail2Ban activo.')
+    if not (1 <= args.run_seconds <= 3600 and 1 <= args.cpu_seconds <= 120 and 1 <= args.run_mib <= 2048):
+        parser.error('Límites globales fuera de rango.')
+    if not args.allow_long_scan and (args.seconds > 30 or args.max_mib > 64 or args.run_seconds > 900 or args.cpu_seconds > 30 or args.run_mib > 256):
+        parser.error('Para ampliar los límites de seguridad usa explícitamente --allow-long-scan.')
     args.thresholds = THRESHOLDS.copy()
     for value in args.threshold:
         try:
@@ -1698,8 +2247,49 @@ def arguments(argv=None):
     return args
 
 
+_WATCH_MODULE = None
+
+
+def watch_module():
+    """Cargar el módulo vecino con -I sin añadir directorios de importación."""
+    global _WATCH_MODULE
+    if _WATCH_MODULE is None:
+        folder = directory(os.path.dirname(os.path.abspath(__file__)))
+        try:
+            with regular(folder, 'audithor_watch.py') as stream:
+                info = os.fstat(stream.fileno())
+                if info.st_uid not in (0, os.geteuid()) or stat.S_IMODE(info.st_mode) & 0o022:
+                    raise RuntimeError('audithor_watch.py no debe ser modificable por otras cuentas.')
+                source = stream.read(128 * 1024 + 1)
+                if len(source) > 128 * 1024:
+                    raise RuntimeError('Módulo watch supera el tamaño permitido.')
+        finally:
+            os.close(folder)
+        module = types.ModuleType('audithor_watch_private')
+        try:
+            exec(compile(source, 'audithor_watch.py', 'exec'), module.__dict__)
+        except (ImportError, SyntaxError) as exc:
+            raise RuntimeError('Módulo watch no disponible: comprueba audithor_watch.py y sqlite3/ctypes de Python.') from exc
+        _WATCH_MODULE = module
+    return _WATCH_MODULE
+
+
+def saved_history(args):
+    try:
+        return watch_module().read_history(args, sys.modules[__name__])
+    except (OSError, RuntimeError, ValueError):
+        return dict(events=[], sessions=[], gaps=[], message='Vigilancia guardada no disponible; no implica ausencia de errores.')
+
+
 def main(argv=None):
     args = arguments(argv)
+    if getattr(args, 'watch', False):
+        return watch_module().run_watch(args, sys.modules[__name__])
+    with RunGuard(args):
+        return guarded_main(args)
+
+
+def guarded_main(args):
     if getattr(args, 'resources', False):
         if not hasattr(os, 'O_NOFOLLOW'):
             raise RuntimeError('--resources requiere Linux.')
@@ -1717,25 +2307,23 @@ def main(argv=None):
         print(pressure_reason(status, args.gentle, rapid=True) or 'Vista rápida: memoria suficiente; con carga alta reduce su ritmo, sin esperar indefinidamente.')
         print('Diagnóstico de solo lectura; no se han abierto logs de dominios.')
         return 0
-    # Cambia únicamente la prioridad y los límites de ESTE proceso.
-    try:
-        os.nice(19)
-        import resource
-        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-        cap = min(128 * 1024 * 1024, hard) if hard != resource.RLIM_INFINITY else 128 * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (min(soft, cap) if soft != resource.RLIM_INFINITY else cap, hard))
-    except (AttributeError, ImportError, OSError, ValueError) as exc:
-        raise RuntimeError('No se pudieron aplicar los límites locales: ' + str(exc))
+    return run_analysis(args)
+
+
+def run_analysis(args):
     print(BANNER)
     print('Audithor ' + VERSION)
     args.server_label = clean(os.uname().nodename, 120)
     print('Servidor de esta ejecución: ' + args.server_label)
     print(f'Período: {args.period_label} ({args.timezone}). Secuencial; memoria virtual máxima 128 MiB.')
     print(f'Tandas de {args.seconds}s/{args.max_mib} MiB. ' + ('MUESTRA limitada por dominio.' if args.sample else 'LECTURA CONTINUA: descansa y continúa hasta finalizar los archivos seleccionados.'))
+    print(f'Límites efectivos: {args.run_seconds}s reales, {args.cpu_seconds}s CPU, {args.run_mib} MiB acumulados; una sola ejecución.')
+    if args.full:
+        print(f'--full acotado por dominio: {max(30, args.seconds)}s / {max(64, args.max_mib)} MiB; puede terminar parcial.')
     print('Logs en solo lectura. Sin instalaciones, cron ni cambios en Plesk, servicios o permisos de las webs.')
     if args.report:
         print('Modo auditoría: todos los dominios seleccionados, sin esperar start; HTML privado en reports/.')
-    print('Bots y humanos son estimaciones. Las señales no confirman ataques.')
+    print('Bots declarados, navegadores aparentes y señales de comportamiento no identifican personas ni confirman ataques.')
     print('Diagnóstico: salud, tráfico sospechoso e impacto potencial; sin atribución de CPU/RAM.')
     if args.threshold:
         print('Umbrales personalizados: ' + ', '.join(args.threshold))
@@ -1749,7 +2337,7 @@ def main(argv=None):
             raise RuntimeError(reason)
         print('VISTA RÁPIDA: archivos probables de la fecha; límites por dominio, sin espera indefinida por carga.')
     else:
-        wait_for_capacity(args.gentle)
+        wait_for_capacity(args.gentle, time.monotonic() + 30)
     root = directory(args.root)
     args.audit = None
     try:
@@ -1761,6 +2349,10 @@ def main(argv=None):
             print('No se encontraron dominios accesibles.')
             return 0
         args.bans = None
+        args.active_bans = None
+        if args.fail2ban_active:
+            args.active_bans = read_active_fail2ban()
+            show_active_fail2ban(args.active_bans)
         if args.domain or args.report:
             print('\nLeyendo historial Fail2Ban…', flush=True)
             args.bans = read_fail2ban(args)
@@ -1772,6 +2364,8 @@ def main(argv=None):
         if args.domain:
             print('\nLeyendo ' + args.domain + '…', flush=True)
             result = analyze(root, args.domain, args.day, args.zone, args)
+            result['watch_history'] = saved_history(args)
+            result['watch_zone'] = args.zone
             show(args.domain, args.day, result, True)
             if args.audit:
                 args.audit.append(args.domain, result)
@@ -1799,8 +2393,11 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except (KeyboardInterrupt, EOFError):
-        print('\nAudithor detenido; no se ha modificado el servidor.')
+        print('\nAudithor detenido; configuración del servidor sin cambios.')
         sys.exit(130)
+    except SafetyLimit as error:
+        print('Audithor: ' + clean(str(error)) + ' Resultados parciales.', file=sys.stderr)
+        sys.exit(75)
     except (OSError, RuntimeError, ValueError, MemoryError) as error:
         print('Audithor: ' + clean(str(error)), file=sys.stderr)
         sys.exit(1)
