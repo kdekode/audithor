@@ -119,6 +119,16 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(len(tracker.ips['10.0.0.0']['paths']), 32)
         self.assertEqual(len(tracker.ips['10.0.0.0']['minutes']), 64)
         self.assertTrue(tracker.partial)
+        self.assertEqual(tracker.limits_hit, {'primeras 1024 IP', '32 rutas por IP', '64 minutos por IP'})
+
+    def test_behavior_path_limit_does_not_claim_ip_limit(self):
+        tracker = a.Behavior()
+        for n in range(40):
+            tracker.add('192.0.2.1', f'/asset{n}.css', 200, '2026-10-20 09:48 +0200', 'probable', False)
+        self.assertTrue(tracker.partial)
+        self.assertEqual(tracker.limits_hit, {'32 rutas por IP'})
+        self.assertEqual(len(tracker.ips), 1)
+        self.assertEqual(tracker.ips['192.0.2.1']['total'], 40)
 
     def test_sensitive_statuses_and_soft404_do_not_confirm_exposure(self):
         result = dict(sensitive_details={

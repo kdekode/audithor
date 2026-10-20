@@ -313,6 +313,27 @@ class WatchTests(unittest.TestCase):
     def test_watch_module_python39_syntax(self):
         ast.parse(Path(w.__file__).read_text(encoding='utf-8'), feature_version=(3, 9))
 
+    def test_missing_watch_folder_is_distinguished_from_permission_failure(self):
+        args = types.SimpleNamespace(domain='example.com')
+        with patch.object(w, 'private_data', side_effect=FileNotFoundError()), patch.object(w.sqlite3, 'connect') as connect:
+            result = w.read_history(args, a)
+        self.assertIn('No hay carpeta', result['message'])
+        self.assertIn('no crea ese historial', result['message'])
+        connect.assert_not_called()
+        with patch.object(w, 'private_data', side_effect=PermissionError()):
+            denied = w.read_history(args, a)
+        self.assertIn('N/D', denied['message'])
+        self.assertNotIn('No hay carpeta', denied['message'])
+
+    def test_empty_watch_history_explains_coverage_without_empty_tables(self):
+        result = dict(events=[], sessions=[], gaps=[], message='No hay vigilancia guardada.')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch.object(a, 'table') as table:
+            w.show_history(result, dt.timezone.utc, a)
+        table.assert_not_called()
+        self.assertIn('Sin incidencias guardadas disponibles', output.getvalue())
+        self.assertIn('cobertura desconocida', output.getvalue())
+
     def protected_fixture(self, status, wait_action):
         """Ejecutar el bucle con archivos/SQLite propios y adaptadores del SO."""
         original_open = os.open

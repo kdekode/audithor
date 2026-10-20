@@ -36,7 +36,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.12.1'
+VERSION = '0.12.2'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -357,11 +357,13 @@ class Behavior:
     def __init__(self):
         self.ips = {}
         self.partial = False
+        self.limits_hit = set()
 
     def add(self, ip, path, status, minute, kind, sensitive):
         if ip not in self.ips:
             if len(self.ips) >= 1024:
                 self.partial = True
+                self.limits_hit.add('primeras 1024 IP')
                 return
             self.ips[ip] = dict(total=0, bot=0, browser=0, sensitive=0, errors=0,
                                 streak=0, max_streak=0, last=None, paths={}, minutes={})
@@ -381,6 +383,7 @@ class Behavior:
                 counter[value] = counter.get(value, 0) + 1
             else:
                 self.partial = True
+                self.limits_hit.add('32 rutas por IP' if key == 'paths' else '64 minutos por IP')
 
     def findings(self):
         out = []
@@ -1662,7 +1665,8 @@ def _analyze(root, domain, day, zone, args):
     active = getattr(args, 'active_bans', None)
     state['active_matches'] = len(set(behavior.ips).intersection(active['ips'])) if active and active['jails'] else None
     if behavior.partial:
-        state['notes'].add('Comportamiento parcial: primeras 1024 IP, hasta 32 rutas y 64 minutos por IP; no descarta automatización fuera de la muestra.')
+        state['notes'].add('Comportamiento parcial: límites alcanzados: ' + ', '.join(sorted(behavior.limits_hit)) +
+                           '. Los contadores generales siguen contando los accesos leídos; algunas señales por IP pueden faltar.')
     if any(approx for value, approx in state['unique_ips'].values()):
         state['notes'].add('IP únicas aproximadas con HLL (2048 registros); error estadístico típico ~2,3%, no cota garantizada.')
     if state['f2b_matches'] is not None:

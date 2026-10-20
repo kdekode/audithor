@@ -1,6 +1,6 @@
-# Audithor 0.12.1
+# Audithor 0.12.2
 
-La versión 0.12.1 corrige el error `NameError: name 'args' is not defined` al arrancar. Conserva los límites de CPU, memoria y tiempo; añade pruebas del arranque protegido también en Windows.
+La versión 0.12.2 aclara qué límite de comportamiento se ha alcanzado y evita las tablas vacías de vigilancia. Conserva la corrección del arranque y los límites de seguridad.
 
 Creado por **steev anderson**.
 
@@ -257,6 +257,8 @@ Etiqueta coincidencias con las redes oficiales de Cloudflare incluidas y verific
 
 Por defecto lee una **muestra de hasta 5 segundos y 8 MiB por dominio**. Con `--week` mantiene ese presupuesto, no lo multiplica por siete. Los números pueden cubrir solo parte del día o de la semana.
 
+Para hoy, la vista rápida usa la cola del log activo: al entrar accesos nuevos, la muestra se desplaza. Por eso sus cifras pueden subir o bajar entre ejecuciones, y el detalle de una web puede diferir de su fila en un recorrido anterior. Compara siempre dominio, período, capa, archivos seleccionados y avisos; ordenar la tabla no convierte las muestras en totales diarios.
+
 Lee poco a poco, sin análisis de dominios en paralelo ni cargar archivos enteros en RAM. Reduce el ritmo con carga alta y aplaza el trabajo si quedan menos de 256 MiB disponibles. Si la carga media supera el mayor de 4 o dos veces el número de CPU lógicas, también aplaza la vista rápida.
 
 Para ir más despacio, añade `--gentle`. Los objetivos de porcentaje de CPU y ritmo de disco siguen siendo reguladores cooperativos, no cuotas del kernel. Hay además límites efectivos independientes:
@@ -330,7 +332,7 @@ python3 -B -m unittest -q
 
 Hay pruebas locales de fechas, selección de logs, límites, tablas, informes y Fail2Ban. Algunas comprobaciones de permisos y enlaces necesitan Linux. Esto no sustituye comprobar los resultados con los logs de tu servidor.
 
-Para 0.12.1: 128 pruebas, 122 correctas y 6 omitidas porque requieren Linux. Las pendientes comprueban descriptores/enlaces/permisos, permisos de informes, límites reales del kernel/bloqueo/temporizador, entrada bruta, privacidad de `data/` e inotify real. Las pruebas de watch usan SQLite y logs temporales: EOF, rotación, truncamiento, copias repetidas, PHP/SQL/nginx/PHP-FPM, secretos, presión, Ctrl+C, cola llena, SQLite lleno/ocupado, retención y ausencia de logs. No se han ejecutado pruebas en los dominios del servidor ni consultas a un Fail2Ban real.
+Para 0.12.2: 131 pruebas, 125 correctas y 6 omitidas porque requieren Linux. Las pendientes comprueban descriptores/enlaces/permisos, permisos de informes, límites reales del kernel/bloqueo/temporizador, entrada bruta, privacidad de `data/` e inotify real. Las pruebas de watch usan SQLite y logs temporales: EOF, rotación, truncamiento, copias repetidas, PHP/SQL/nginx/PHP-FPM, secretos, presión, Ctrl+C, cola llena, SQLite lleno/ocupado, retención y ausencia de logs. No se han ejecutado pruebas en los dominios del servidor ni consultas a un Fail2Ban real.
 
 Comparación local con 0.10.0 sobre 12.000 accesos: ambas versiones leyeron 1.396.357 bytes y encontraron las mismas peticiones. Mediana de tres recorridos: 0,5000 s CPU antes y 0,5469 s después; pico de asignaciones Python de 449,9 a 460,8 KiB. Es una prueba pequeña con una IP repetida, lector adaptado a Windows y pausas/estado del host simulados. No mide RSS ni predice el coste con miles de IP; los topes de estructuras y los límites de ejecución controlan esos casos.
 

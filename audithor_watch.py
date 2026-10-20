@@ -728,6 +728,9 @@ def read_history(args, api, base=None):
  WHERE s.domain=? AND g.at>=? AND g.at<? ORDER BY g.at DESC LIMIT 50''', (args.domain, start, stop)).fetchall()
         if result['sessions']:
             result['message'] = 'Solo intervalos vigilados; hasta 50 grupos, 20 sesiones y 50 avisos. No cubre el día completo por sí solo.'
+    except FileNotFoundError:
+        result['message'] = ('No hay carpeta de vigilancia guardada disponible. --watch solo guarda datos mientras lo ejecutas; '
+                             'el análisis normal no crea ese historial. No implica ausencia de errores.')
     except (OSError, RuntimeError, ValueError, sqlite3.Error):
         result['message'] = 'Incidencias guardadas N/D: data/ ausente, privada de otro usuario, SQLite ocupado o no legible. No se modifica.'
     finally:
@@ -771,14 +774,19 @@ def show_history(result, zone, api):
     print('\nINCIDENCIAS GUARDADAS POR --watch')
     print('  ' + result['message'])
     events, sessions, gaps = history_rows(result, zone, api)
-    api.table(('PRIMERA HORA', 'ÚLTIMA HORA', 'VECES', 'TIPO', 'GRAVEDAD', 'HTTP', 'RUTA', 'PHP/LÍNEA', 'SERVICIO'),
-              [row[:9] for row in events], (25, 25, 6, 25, 9, 5, 25, 30, 12))
+    if events:
+        api.table(('PRIMERA HORA', 'ÚLTIMA HORA', 'VECES', 'TIPO', 'GRAVEDAD', 'HTTP', 'RUTA', 'PHP/LÍNEA', 'SERVICIO'),
+                  [row[:9] for row in events], (25, 25, 6, 25, 9, 5, 25, 30, 12))
+    else:
+        print('  Sin incidencias guardadas disponibles para este período.')
     for event in events:
         print('  Evidencia: ' + api.clean(event[9], 256))
         print('  Revisar: ' + event[10])
-    api.table(('INICIO', 'ÚLTIMO LATIDO', 'FIN', 'INTERRUPCIÓN/FIN', 'OMITIDOS', 'BYTES OMITIDOS', 'FUENTES'),
-              sessions, (25, 25, 25, 35, 9, 14, 65))
-    api.table(('HORA', 'PÉRDIDA/AVISO', 'EVENTOS CONOCIDOS', 'BYTES'), gaps, (25, 65, 17, 12))
+    if sessions:
+        api.table(('INICIO', 'ÚLTIMO LATIDO', 'FIN', 'INTERRUPCIÓN/FIN', 'OMITIDOS', 'BYTES OMITIDOS', 'FUENTES'),
+                  sessions, (25, 25, 25, 35, 9, 14, 65))
+    if gaps:
+        api.table(('HORA', 'PÉRDIDA/AVISO', 'EVENTOS CONOCIDOS', 'BYTES'), gaps, (25, 65, 17, 12))
     print('  Sin sesión o fuera de estos intervalos: cobertura desconocida. Cero incidencias no significa cero errores.')
 
 
