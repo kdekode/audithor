@@ -390,6 +390,45 @@ def explanation(key):
     }.get(key, ('Mensaje de error observado; no se ha demostrado su causa.', 'Revisar el log y servicio indicados en esa franja.'))
 
 
+def workload_issue(key, count, window, api):
+    """Convierte contadores cerrados de accesos en una pista, sin afirmar causalidad."""
+    rules = {
+        'wp_rocket_preload': (10, 50, 'Precarga de WP Rocket observada',
+            'El agente WP Rocket/Preload solicitó páginas. Una precarga grande puede ocupar PHP-FPM y CPU, como se comprobó en Escaparate Digital.',
+            'Comprobar en WP Rocket si la precarga está activa y comparar el pool antes/después de pausarla.'),
+        'action_scheduler': (20, 100, 'Ejecuciones de Action Scheduler',
+            'Se observaron llamadas al runner asíncrono. Pueden proceder de WooCommerce u otros plugins y solaparse con peticiones internas de WordPress.',
+            'Revisar en WordPress la cola pendiente y sus hooks principales; no cancelar tareas sin identificar su origen.'),
+        'wp_cron': (20, 100, 'Muchas llamadas a WP-Cron',
+            'Se observaron peticiones a wp-cron.php. El log no permite saber qué tarea se ejecutó ni cuánto consumió.',
+            'Revisar frecuencia y tareas; en Plesk valorar cron real con DISABLE_WP_CRON tras comprobar que no exista ya.'),
+        'wordpress_loopback': (50, 200, 'Muchas peticiones internas de WordPress',
+            'El User-Agent identifica llamadas HTTP de WordPress a la propia web. Puede incluir cron, colas, precargas u otras integraciones.',
+            'Cruzar las horas y rutas con WP-Cron, Action Scheduler y precargas; los contadores pueden solaparse.'),
+        'amazonbot': (100, None, 'Tráfico de Amazonbot',
+            'Amazonbot se identificó en el User-Agent. El nombre declarado no demuestra el coste de cada respuesta.',
+            'Revisar rutas, códigos y bytes; limitarlo en nginx o robots solo si no aporta valor y la política del sitio lo permite.'),
+        'geedoshop': (100, None, 'Tráfico de GeedoShopProductFinder',
+            'GeedoShopProductFinder se identificó en el User-Agent. Puede generar volumen, pero el log no demuestra CPU consumida.',
+            'Revisar rutas y frecuencia; si no es necesario, limitarlo en nginx y comprobar con un User-Agent normal.'),
+        'plesk_screenshot': (50, None, 'Capturas automáticas de Plesk frecuentes',
+            'Se observó el agente de capturas de Plesk. Normalmente es administrativo, pero una frecuencia alta merece revisión.',
+            'Revisar la frecuencia de generación de miniaturas o capturas en Plesk.'),
+    }
+    if key not in rules:
+        return None
+    medium, high, title, hypothesis, action = rules[key]
+    if count < medium:
+        return None
+    priority = 'ALTA' if high is not None and count >= high else 'MEDIA'
+    first, last = (window or [None, None])[:2]
+    period = (' entre ' + first + ' y ' + last) if first and last else ''
+    return dict(key='workload_' + key, title=title, priority=priority,
+                evidence=f'{count} peticiones identificadas{period}.', count=None,
+                first=None, last=None, sources=['accesos del dominio'], service='web/WordPress',
+                hypothesis=hypothesis, action=action)
+
+
 def diagnose(domain, result, snapshot, args, api=None):
     issues = []
     for key, item in snapshot.get('logs', {}).get(domain, {}).items():
@@ -412,6 +451,10 @@ def diagnose(domain, result, snapshot, args, api=None):
                             evidence='', count=None, first=None, last=None, sources=['/proc'], service='PHP-FPM', hypothesis=hypothesis, action=action)
             issues.append(capacity)
         capacity['current_evidence'] = f"{pool['count']} procesos medidos; CPU conjunta {pool['cpu']:.1f}% de un núcleo, captura {snapshot['captured']}. No son procesos necesariamente ocupados ni duración de peticiones."
+    for key, count in result.get('workloads', {}).items():
+        issue = workload_issue(key, count, result.get('workload_windows', {}).get(key), api)
+        if issue:
+            issues.append(issue)
     d = result.get('diagnosis') or {}
     for yes, key, title, priority, evidence, hypothesis, action in (
         (d.get('health') in ('REVISAR', 'CRÍTICO'), 'http5', 'Respuestas HTTP de error del servidor',

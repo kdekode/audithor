@@ -36,7 +36,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.14.0'
+VERSION = '0.15.0'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -46,6 +46,18 @@ BROWSER = re.compile(r'Mozilla/5\.0.*(?:Firefox/|Chrome/|Safari/|Edg/)', re.I)
 SENSITIVE = re.compile(r'(?:^|/)(?:\.env|\.git|wp-login\.php|xmlrpc\.php|phpmyadmin)(?:[/.]|$)', re.I)
 EXPOSURE = re.compile(r'(?:^|/)(?:\.env(?:[./]|$)|\.git(?:/|$)|wp-config\.php(?:[.~]|$)|(?:backup|database)\.(?:sql|zip)(?:$|/))', re.I)
 BAN = re.compile(r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?\s+fail2ban\.actions\s+(?:\[\d+\])?:?\s+[A-Z]+\s+\[([^\]]{1,120})\]\s+Ban\s+(\S+)\s*$')
+
+# Señales cerradas y explicables de trabajo en segundo plano. Nunca se conserva
+# la consulta completa ni el User-Agent recibido del log.
+WORKLOAD_LABELS = {
+    'wp_rocket_preload': 'Precarga de WP Rocket',
+    'action_scheduler': 'Cola de Action Scheduler',
+    'wp_cron': 'Llamadas a WP-Cron',
+    'wordpress_loopback': 'Peticiones internas de WordPress',
+    'amazonbot': 'Amazonbot',
+    'geedoshop': 'GeedoShopProductFinder',
+    'plesk_screenshot': 'Capturas automáticas de Plesk',
+}
 
 
 def clean(value, limit=180):
@@ -96,6 +108,33 @@ def parse(line, zone):
                 ip, stamp.strftime('%Y-%m-%d %H:%M %z'))
     except (ValueError, KeyError, UnicodeError, OverflowError):
         return None
+
+
+def workload_signals(line):
+    """Clasifica causas conocidas sin retener consultas ni agentes arbitrarios."""
+    match = ACCESS.match(line)
+    if not match:
+        return ()
+    target = match[4].lower()
+    path = target.split(b'?', 1)[0]
+    agent = match[7].lower()
+    found = []
+    if b'wp rocket/preload' in agent:
+        found.append('wp_rocket_preload')
+    if path == b'/wp-cron.php':
+        found.append('wp_cron')
+    if path == b'/wp-admin/admin-ajax.php' and re.search(
+            rb'(?:[?&])action=as_async_request_queue_runner(?:&|$)', target):
+        found.append('action_scheduler')
+    if agent.startswith(b'wordpress/'):
+        found.append('wordpress_loopback')
+    if b'amazonbot' in agent:
+        found.append('amazonbot')
+    if b'geedoshopproductfinder' in agent:
+        found.append('geedoshop')
+    if b'plesk screenshot bot' in agent or b'pleskbot' in agent:
+        found.append('plesk_screenshot')
+    return tuple(found)
 
 
 def directory(path, start=None):
@@ -1492,7 +1531,9 @@ def analyze(root, domain, day, zone, args):
 def _analyze(root, domain, day, zone, args):
     detailed = bool(args.domain or getattr(args, 'report', False))
     state = dict(inodes=set(), notes=set(), counts=collections.Counter(), urls=collections.Counter(),
-                 bytes_urls=collections.Counter(), errors=collections.Counter(), statuses=collections.Counter(),
+                 bytes_urls=collections.Counter(), largest_urls=collections.Counter(),
+                 workloads=collections.Counter(), workload_windows={},
+                 errors=collections.Counter(), statuses=collections.Counter(),
                  internal=collections.Counter(),
                  error_clients=collections.Counter(), error_minutes={}, fourxx_hints=collections.Counter(),
                  timing_count=0, slow_count=0, timing_sum=0.0, timing_max=0.0,
@@ -1565,6 +1606,11 @@ def _analyze(root, domain, day, zone, args):
                     state['statuses'][status] += 1
                     state['http4'] += int(400 <= status < 500)
                     state['http5'] += int(status >= 500)
+                    for signal in workload_signals(line):
+                        state['workloads'][signal] += 1
+                        window = state['workload_windows'].setdefault(signal, [minute, minute])
+                        window[0] = min(window[0], minute)
+                        window[1] = max(window[1], minute)
                     probe = bool(SENSITIVE.search(unquote(path)) or EXPOSURE.search(path))
                     uniques['all'].add(ip)
                     uniques[kind].add(ip)
@@ -1622,6 +1668,10 @@ def _analyze(root, domain, day, zone, args):
                     if detailed:
                         increment(state['urls'], path)
                         increment(state['bytes_urls'], path, size)
+                        if path in state['largest_urls'] or len(state['largest_urls']) < 2000:
+                            state['largest_urls'][path] = max(state['largest_urls'].get(path, 0), size)
+                        else:
+                            state['notes'].add('Respuestas individuales parciales: máximo 2000 rutas.')
                         if status >= 400:
                             increment(state['errors'], str(status) + ' ' + path)
                             increment(state['error_clients'], ip, overflow='[otras IP: límite de memoria]')
@@ -1725,6 +1775,13 @@ def show_brief(domain, day, result):
               (' · ' + result['peak_minute'] if result.get('peak_minute') else ''))
     else:
         print('  N/D: no se encontraron accesos suficientes del período; no significa tráfico cero.')
+    workloads = collections.Counter(result.get('workloads', {}))
+    if workloads:
+        print('\n  ACTIVIDAD DE FONDO IDENTIFICADA · los grupos pueden solaparse')
+        for key, count in workloads.most_common(7):
+            window = result.get('workload_windows', {}).get(key) or []
+            period = f' · {window[0]} a {window[1]}' if len(window) == 2 else ''
+            print(f'    {count:,} peticiones · {WORKLOAD_LABELS.get(key, key)}{period}')
     for title, key in (('RUTAS MÁS SOLICITADAS', 'urls'), ('RUTAS CON ERRORES', 'errors')):
         rows = result.get(key, collections.Counter()).most_common(3)
         if rows:
@@ -1733,8 +1790,13 @@ def show_brief(domain, day, result):
                 print(textwrap.fill(f'{count:,} peticiones · {path}', width=88, initial_indent='    ', subsequent_indent='      '))
     transfers = result.get('bytes_urls', collections.Counter()).most_common(3)
     if transfers:
-        print('\n  MÁS CONTENIDO ENVIADO · no mide CPU ni RAM')
+        print('\n  RUTAS QUE MÁS DATOS HAN SERVIDO · acumulado de la muestra')
         for path, count in transfers:
+            print(textwrap.fill(f'{count/1048576:.2f} MiB · {path}', width=88, initial_indent='    ', subsequent_indent='      '))
+    largest = result.get('largest_urls', collections.Counter()).most_common(3)
+    if largest:
+        print('\n  RESPUESTAS INDIVIDUALES MÁS GRANDES · tamaño indicado por el log')
+        for path, count in largest:
             print(textwrap.fill(f'{count/1048576:.2f} MiB · {path}', width=88, initial_indent='    ', subsequent_indent='      '))
     matches = result.get('f2b_matches')
     if matches:
@@ -1835,7 +1897,8 @@ def show(domain, day, result, detail=False, verbose=False):
         table(('MINUTO', '4xx', '5xx', '502/503/504', 'PETICIONES'),
               [(m, e[0], e[1], e[2], result['minutes'][m]) for m, e in temporal_rows], (28, 7, 7, 12, 12))
         for title, key, unit in [('URLs con más peticiones', 'urls', 'PETICIONES'),
-                                 ('URLs con más transferencia (no mide CPU)', 'bytes_urls', 'BYTES'),
+                                 ('URLs con más transferencia acumulada (no mide CPU)', 'bytes_urls', 'BYTES'),
+                                 ('Respuestas individuales más grandes observadas', 'largest_urls', 'BYTES'),
                                  ('Errores HTTP 4xx/5xx por URL', 'errors', 'PETICIONES'),
                                  ('Accesos a rutas sensibles (incluye usos legítimos)', 'sensitive_urls', 'PETICIONES'),
                                  ('IP con más peticiones (dirección registrada)', 'ip_counts', 'PETICIONES'),
@@ -1900,6 +1963,7 @@ def traffic_key(row):
 OVERVIEW_COLUMNS = (
     ('DOMINIO', 32), ('PETICIONES', 10), ('MiB', 9), ('IP ÚNICAS', 10), ('BOTS %', 7),
     ('NAV. %', 7), ('DESC. %', 7), ('MÁX. PET/MIN', 12), ('AVISOS', 6), ('PRIORIDAD', 11),
+    ('QUÉ REVISAR PRIMERO', 30),
 )
 
 
@@ -1924,13 +1988,16 @@ def show_overview_row(domain, result):
     percent = lambda key: f'{100*result["counts"][key]/total:.1f}' if total else 'N/D'
     triage = result.get('triage', {})
     notice_count = str(triage['count']) + ('*' if triage.get('partial') else '') if triage else 'N/D'
+    issues = triage.get('issues') or []
+    first_issue = issues[0].get('title', '-') if issues else ('-' if triage else 'Diagnóstico no disponible')
     print(overview_line((domain, f'{total:,}' if known and total else 'N/D',
                          f'{result["bytes"]/1048576:.2f}' if known and total else 'N/D',
                          unique_text((result.get('unique_ips') or {}).get('all')) if total else 'N/D',
                          percent('bot'), percent('probable'), percent('unknown'),
                          f'{result.get("peak", 0):,}' if total else 'N/D',
                          notice_count,
-                         result.get('triage', {}).get('priority', 'SIN DATOS'))), flush=True)
+                         result.get('triage', {}).get('priority', 'SIN DATOS'),
+                         first_issue)), flush=True)
 
 
 def overview_progress(text=''):
@@ -2016,6 +2083,13 @@ def html_section(domain, result, args):
     output += '<p>IP no equivale a visitante. Categorías de IP solapadas. ~ = estimación HLL (2048 registros, error típico ~2,3%, no garantizado). Exacto hasta 1024 IP de la lectura. Comportamiento: primeras 1024 IP, 32 rutas/64 minutos por IP; hasta 20 hallazgos. No hay probabilidades de humanidad.</p>'
     output += html_table(('IP', 'Peticiones', 'Navegador aparente', 'Pico/min', 'Señales'),
                          [(ip_label(r['ip']), r['requests'], r['browser'], r['peak'], r['reasons']) for r in result.get('behavior', [])])
+    workload_rows = []
+    for key, count in collections.Counter(result.get('workloads', {})).most_common():
+        window = result.get('workload_windows', {}).get(key) or ('N/D', 'N/D')
+        workload_rows.append((WORKLOAD_LABELS.get(key, key), count, window[0], window[1]))
+    output += '<h3>Actividad de fondo identificada</h3>' + html_table(
+        ('Señal', 'Peticiones', 'Primera', 'Última'), workload_rows)
+    output += '<p>Los grupos pueden solaparse. Identifican rutas o agentes declarados; no miden por sí solos CPU ni prueban causalidad.</p>'
     output += '<h3>Rutas sensibles: posibles exposiciones primero</h3>' + html_table(
         ('Ruta', 'Total', '200', '401', '403', '404', 'Otros', 'IP y conteo', 'Revisión'), sensitive_rows(result))
     output += '<p>HTTP 200 no verifica contenido: posibles errores personalizados/front controller. No se descarga nada. Hasta 64 rutas y primeras 8 IP por ruta; ranking parcial si se rebasa el límite.</p>'
@@ -2035,7 +2109,8 @@ def html_section(domain, result, args):
     output += '<h3>Indicadores para revisar</h3><ul>' + ''.join('<li>' + esc(f) + '</li>' for f in findings) + '</ul>'
     if not findings:
         output += '<p>Sin umbrales activados en los datos leídos; no descarta un ataque.</p>'
-    for title, key in [('URLs con más peticiones', 'urls'), ('URLs con más bytes de respuesta', 'bytes_urls'),
+    for title, key in [('URLs con más peticiones', 'urls'), ('URLs con más bytes acumulados', 'bytes_urls'),
+                       ('Respuestas individuales más grandes', 'largest_urls'),
                        ('Errores HTTP por ruta', 'errors'), ('Rutas sensibles consultadas', 'sensitive_urls'),
                        ('IP con más peticiones', 'ip_counts'), ('IP con más respuestas de error', 'error_clients'),
                        ('Mensajes internos por categoría', 'internal'),
