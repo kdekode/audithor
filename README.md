@@ -1,6 +1,8 @@
-# Audithor 0.13.0
+# Audithor 0.13.1
 
 La 0.13 añade un resumen práctico: **avisos, prioridad y qué revisar en cada dominio**, cruzando errores ya registrados con una muestra breve de procesos actuales. No corrige webs ni desactiva plugins por su cuenta.
+
+La 0.13.1 simplifica la salida: una sola tabla progresiva, sin repetirla ni ordenarla al final. Quita 4xx/5xx y ESTADO de las tablas globales; mantiene los datos de diagnóstico al consultar un dominio. El resumen de atención muestra los motivos en la propia lista, sin repetir descripciones debajo ni añadir bloques vacíos.
 
 Creado por **steev anderson**.
 
@@ -27,7 +29,7 @@ python3 -I -B audithor.py --date 2026-10-18      # una fecha concreta
 
 Va **dominio a dominio** y muestra una fila al terminar cada uno. Después de 70, si quedan más, pide escribir `start` para seguir. Con `q` terminas; Enter solo no inicia otra tanda.
 
-Al acabar repite la tabla **de más a menos peticiones**, usando los resultados que ya tiene. No vuelve a leer los logs para ordenarla.
+Cada fila se imprime una sola vez, en el orden del recorrido. Al terminar muestra cuántos dominios se consultaron; no repite ni ordena la tabla de tráfico.
 
 Después añade **DOMINIOS QUE REQUIEREN ATENCIÓN**, primero por prioridad y número de avisos agrupados y después por salud, impacto potencial y tráfico sospechoso. El detalle explica qué ha visto, qué podría estar pasando y qué revisar en Plesk. El HTML incluye lo mismo.
 
@@ -161,14 +163,13 @@ La vigilancia de hoy no puede reconstruir ayer. La consulta muestra hasta 50 gru
 | MiB | Contenido enviado según el log. No es consumo de RAM ni CPU. |
 | IP ÚNICAS | Direcciones distintas observadas en esa web y período; `~` significa aproximación. No son visitantes. |
 | BOTS / NAV. / DESC. | Automatización declarada en el User-Agent, navegador aparente y tráfico sin identificar. Son etiquetas del log, no probabilidades de humanidad. |
-| 4xx | Respuestas como 403 o 404: solicitudes rechazadas o recursos no encontrados. |
-| 5xx | Respuestas como 500 o 503: errores del servidor. |
-| PICO/MIN | El minuto con más peticiones de los que se han leído. |
-| ESTADO | Volumen orientativo y avisos de la lectura. |
+| MÁX. PET/MIN | Mayor número de peticiones leídas en un minuto concreto de la muestra. Incluye imágenes, CSS y bots. No es tráfico en directo ni necesariamente el máximo de todo el día. |
+| AVISOS | Número de problemas agrupados; `*` indica diagnóstico adicional parcial. |
+| PRIORIDAD | Orden orientativo de revisión según las evidencias, no una confirmación de ataque. |
 
-En ESTADO, **M** significa muestra; **A**, avisos adicionales; **REV:n**, cuántas condiciones de revisión se han activado. **SIN FECHA** significa que no se encontraron accesos de esa fecha en la lectura, no que el tráfico fuera cero.
+**N/D** significa que la lectura no aporta datos suficientes; no equivale a tráfico cero. Los códigos 4xx/5xx se conservan en el detalle y los detectores, pero no ocupan columnas en las tablas globales. Si no hay dominios con condiciones de revisión ni coincidencias compartidas, no aparecen secciones vacías al final. Los detalles se consultan indicando el dominio.
 
-El pico se etiqueta como BAJA (<60/min), MODERADA (60–599), ALTA (600–2999) o MUY ALTA (3000 o más). No compara con el tráfico habitual de esa web ni confirma un ataque.
+En el detalle, el pico se etiqueta como BAJA (<60/min), MODERADA (60–599), ALTA (600–2999) o MUY ALTA (3000 o más). No compara con el tráfico habitual de esa web ni confirma un ataque.
 
 Marca revisión con al menos 20 accesos a rutas sensibles rechazados con 4xx, un 50% de 4xx sobre al menos 100 peticiones, o un 10% de 5xx sobre al menos 20. Puede ser un fallo de la web, tráfico legítimo o algo sospechoso: toca mirar el detalle.
 
@@ -212,7 +213,7 @@ python3 -I -B audithor.py ejemplo.com --threshold sustained_rpm=900 --threshold 
 
 Con duración suficiente, ningún acceso lento y sin errores de gateway ni mensajes de límites, el impacto se etiqueta BAJO por las señales observadas de latencia. No certifica un consumo bajo. Una señal explícita de límites PHP-FPM/Apache/backend basta para POSIBLE. Tráfico ALTO también puede marcarse con los picos sostenidos anteriores, al menos 50% de bots y 50% de 4xx.
 
-Todos los nombres y valores aparecen en `--help`. Los porcentajes admiten valores mayores que 0 y hasta 100; los contadores son enteros positivos hasta un millón, las rachas hasta 60 minutos, la duración hasta 600 segundos y los dominios compartidos entre 2 y 8. Los límites críticos no pueden ser menores que los de revisión. Estos ajustes afectan al diagnóstico nuevo; la columna ESTADO conserva sus señales anteriores.
+Todos los nombres y valores aparecen en `--help`. Los porcentajes admiten valores mayores que 0 y hasta 100; los contadores son enteros positivos hasta un millón, las rachas hasta 60 minutos, la duración hasta 600 segundos y los dominios compartidos entre 2 y 8. Los límites críticos no pueden ser menores que los de revisión. Estos ajustes afectan al diagnóstico; los detectores HTTP siguen disponibles en el detalle.
 
 ### Cuando coinciden varias webs
 
@@ -364,7 +365,7 @@ python3 -B -m unittest -q
 
 Hay pruebas locales de fechas, selección de logs, límites, tablas, informes y Fail2Ban. Algunas comprobaciones de permisos y enlaces necesitan Linux. Esto no sustituye comprobar los resultados con los logs de tu servidor.
 
-Para 0.13.0: 160 pruebas, 154 correctas y 6 omitidas porque requieren Linux. Las pendientes comprueban descriptores/enlaces/permisos, permisos de informes, límites reales del kernel/bloqueo/temporizador, entrada bruta, privacidad de `data/` e inotify real. Las pruebas de watch usan SQLite y logs temporales: EOF, rotación, truncamiento, copias repetidas, PHP/SQL/nginx/PHP-FPM, secretos, presión, Ctrl+C, cola llena, SQLite lleno/ocupado, retención y ausencia de logs. El diagnóstico adicional reproduce el caso de dos avisos, filtra por pool y período, respeta zonas horarias, descarta PID reutilizados, limita estructuras y lecturas, y comprueba cobertura parcial, ambas capas, HTML y presión alta. No se han ejecutado pruebas en los dominios del servidor ni consultas a un Fail2Ban real.
+Para 0.13.1: 161 pruebas, 155 correctas y 6 omitidas porque requieren Linux. Las pendientes comprueban descriptores/enlaces/permisos, permisos de informes, límites reales del kernel/bloqueo/temporizador, entrada bruta, privacidad de `data/` e inotify real. Las pruebas de watch usan SQLite y logs temporales: EOF, rotación, truncamiento, copias repetidas, PHP/SQL/nginx/PHP-FPM, secretos, presión, Ctrl+C, cola llena, SQLite lleno/ocupado, retención y ausencia de logs. El diagnóstico adicional reproduce el caso de dos avisos, filtra por pool y período, respeta zonas horarias, descarta PID reutilizados, limita estructuras y lecturas, y comprueba cobertura parcial, ambas capas, HTML y presión alta. No se han ejecutado pruebas en los dominios del servidor ni consultas a un Fail2Ban real.
 
 Comparación local con 0.10.0 sobre 12.000 accesos: ambas versiones leyeron 1.396.357 bytes y encontraron las mismas peticiones. Mediana de tres recorridos: 0,5000 s CPU antes y 0,5469 s después; pico de asignaciones Python de 449,9 a 460,8 KiB. Es una prueba pequeña con una IP repetida, lector adaptado a Windows y pausas/estado del host simulados. No mide RSS ni predice el coste con miles de IP; los topes de estructuras y los límites de ejecución controlan esos casos.
 

@@ -438,6 +438,8 @@ def diagnose(domain, result, snapshot, args, api=None):
 
 
 def show(result, api):
+    if not result['issues'] and not result.get('processes'):
+        return
     print('\n  RESUMEN PARA REVISAR · avisos agrupados por problema')
     print(f"  Avisos: {result['count']} | Prioridad: {result['priority']}")
     for n, row in enumerate(result['issues'], 1):
@@ -464,6 +466,8 @@ def show(result, api):
 
 
 def render_html(result, api):
+    if not result['issues'] and not result.get('processes'):
+        return ''
     esc = html.escape
     output = '<h3>Resumen para revisar</h3><p>Avisos: ' + str(result['count']) + ' · Prioridad: ' + esc(result['priority']) + '</p>'
     for row in result['issues']:

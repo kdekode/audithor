@@ -199,7 +199,7 @@ class Tests(unittest.TestCase):
             self.assertTrue(sleep.called)
             self.assertLessEqual(sleep.call_args.args[0], .25)
 
-    def test_global_ranking_includes_later_domains_and_discards_routes(self):
+    def test_global_table_keeps_scan_order_and_discards_routes(self):
         domains = ['a.com', 'b.com', 'c.com', 'd.com', 'unread.com']
         def result(root, domain, day, zone, args):
             totals = {'a.com': 10, 'b.com': 30, 'c.com': 0, 'd.com': 100, 'unread.com': 0}
@@ -210,7 +210,7 @@ class Tests(unittest.TestCase):
         args = type('Args', (), {'gentle': True})()
         with patch.object(a, 'pressure', return_value=None), patch.object(a, 'analyze', side_effect=result) as analyze, contextlib.redirect_stdout(io.StringIO()):
             rows = a.collect_ranked(0, domains, None, None, args)
-        self.assertEqual([row[0] for row in rows], ['d.com', 'b.com', 'a.com', 'c.com', 'unread.com'])
+        self.assertEqual([row[0] for row in rows], domains)
         self.assertEqual(analyze.call_count, 5)
         self.assertTrue(all('urls' not in summary for _, summary in rows))
 
@@ -467,7 +467,10 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(lines[1]), len(lines[3]))
         self.assertIn('example.com', lines[3])
         self.assertIn('1,920', lines[3])
-        self.assertIn('MODERADA/M', lines[3])
+        self.assertIn('MÁX. PET/MIN', lines[1])
+        self.assertIn('355', lines[3])
+        for removed in ('ESTADO', '4xx', '5xx'):
+            self.assertNotIn(removed, lines[1])
         self.assertIn('DESC. %', lines[1])
         self.assertNotIn('QUÉ SE HA MEDIDO', output.getvalue())
 
@@ -478,7 +481,7 @@ class Tests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             a.show_overview_row('example.com', result)
         self.assertEqual(output.getvalue().split()[1:3], ['N/D', 'N/D'])
-        self.assertIn('SIN FECHA', output.getvalue())
+        self.assertIn('SIN DATOS', output.getvalue())
 
     def test_probe_distinguishes_timestamp_from_combined_format(self):
         dates, combined = a.probe_chunk(line('/private?password=secret'), dt.timezone.utc)

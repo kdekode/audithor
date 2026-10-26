@@ -36,7 +36,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.13.0'
+VERSION = '0.13.1'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -1339,14 +1339,20 @@ def requires_attention(result):
 
 def attention_values(domain, result):
     d = result.get('diagnosis') or diagnose_domain(result)
-    total = result.get('total', 0)
-    return (domain, total, result.get('http4', 0), result.get('http5', 0),
-            f'{100*result.get("http5", 0)/total:.1f}%' if total else 'N/D', result.get('peak', 0),
-            d['health'], d['suspicious'], d['impact'], result.get('triage', {}).get('count', 'N/D'),
-            result.get('triage', {}).get('priority', 'SIN DATOS'))
+    triage = result.get('triage')
+    if triage is not None:
+        return (domain, triage['count'], triage['priority'], '; '.join(issue['title'] for issue in triage['issues']))
+    reasons = []
+    if d['health'] in ('REVISAR', 'CRÍTICO'):
+        reasons.append('Errores HTTP del servidor')
+    if d['suspicious'] in ('MODERADO', 'ALTO'):
+        reasons.append('Señales de automatización/exploración')
+    if d['impact'] in ('POSIBLE', 'ALTO POTENCIAL'):
+        reasons.append('Señales de presión de backend')
+    return (domain, 'N/D', 'ALTA' if d['health'] == 'CRÍTICO' else 'MEDIA', '; '.join(reasons) or 'Revisar diagnóstico del dominio')
 
 
-ATTENTION_HEADERS = ('DOMINIO', 'PETICIONES', '4xx', '5xx', '%5xx', 'PICO/MIN', 'SALUD WEB', 'SOSPECHOSO', 'IMPACTO POTENCIAL', 'AVISOS', 'PRIORIDAD')
+ATTENTION_HEADERS = ('DOMINIO', 'AVISOS', 'PRIORIDAD', 'DETECTADO')
 
 
 def show_diagnosis(d):
@@ -1354,6 +1360,8 @@ def show_diagnosis(d):
     table(('INDICADOR', 'RESULTADO'), [('Salud web', d['health']), ('Tráfico sospechoso', d['suspicious']),
                                      ('Impacto potencial', d['impact'])], (26, 40))
     for label, key in (('Hechos', 'facts'), ('Hipótesis', 'hypotheses'), ('Qué revisar', 'actions')):
+        if not d[key]:
+            continue
         print('\n  ' + label + ':')
         for item in d[key]:
             # Mantener legible el detalle en terminales de 90 columnas.
@@ -1363,19 +1371,10 @@ def show_diagnosis(d):
 
 
 def show_attention(rows, shared=None):
-    print('\nDOMINIOS QUE REQUIEREN ATENCIÓN · solo esta ejecución y servidor')
     selected = sorted((r for r in rows if requires_attention(r[1])), key=diagnosis_key)
-    table(ATTENTION_HEADERS, [attention_values(*r) for r in selected[:100]], (32, 10, 7, 7, 7, 8, 13, 13, 17, 6, 11))
-    if not selected:
-        print('  Sin condiciones activadas en los datos leídos; no descarta problemas ni falta de cobertura.')
-    for domain, result in selected[:100]:
-        print('\n  ' + domain)
-        if 'triage' in result:
-            for issue in result['triage']['issues']:
-                print('    ' + issue['priority'] + ' · ' + issue['title'])
-            print('    Detalle: python3 -I -B audithor.py ' + domain + ' (añade el mismo período si era histórico).')
-        else:
-            show_diagnosis(result.get('diagnosis') or diagnose_domain(result))
+    if selected:
+        print('\nDOMINIOS QUE REQUIEREN ATENCIÓN · solo esta ejecución y servidor')
+        table(ATTENTION_HEADERS, [attention_values(*r) for r in selected[:100]], (32, 6, 11, 92))
     if len(selected) > 100:
         print('  Se muestran los primeros 100; consulta el detalle del resto por dominio.')
     if shared:
@@ -1384,9 +1383,7 @@ def show_attention(rows, shared=None):
             print('\nPOSIBLE INCIDENCIA COMPARTIDA DEL SERVIDOR')
             table(('MINUTO', 'HECHO OBSERVADO', 'DOMINIOS'), findings, (28, 28, 65))
             print('  Hipótesis: revisar servicios comunes en esa franja. Sin línea base no se demuestra un aumento ni una causa compartida.')
-        else:
-            print('\nSin coincidencias compartidas que alcancen los umbrales en la lectura.')
-        print('  Correlación de accesos del mismo recorrido; no se mezclan servidores ni ejecuciones. Muestras pueden ocultar coincidencias.')
+            print('  Correlación del mismo recorrido; muestras pueden ocultar coincidencias.')
         if shared.partial:
             print('  Correlación PARCIAL: máximo 2048 minutos y 8 dominios por grupo; se muestran hasta 20 coincidencias.')
 
@@ -1843,8 +1840,7 @@ def traffic_key(row):
 
 OVERVIEW_COLUMNS = (
     ('DOMINIO', 32), ('PETICIONES', 10), ('MiB', 9), ('IP ÚNICAS', 10), ('BOTS %', 7),
-    ('NAV. %', 7), ('DESC. %', 7), ('4xx (#)', 7), ('5xx (#)', 7),
-    ('PICO/MIN', 8), ('ESTADO', 14), ('AVISOS', 6), ('PRIORIDAD', 11),
+    ('NAV. %', 7), ('DESC. %', 7), ('MÁX. PET/MIN', 12), ('AVISOS', 6), ('PRIORIDAD', 11),
 )
 
 
@@ -1854,7 +1850,7 @@ def overview_line(values):
         text = clean(value, 1000)
         if len(text) > width:
             text = text[:width-3] + '...'
-        cells.append(text.ljust(width) if index in (0, 9) else text.rjust(width))
+        cells.append(text.ljust(width) if index == 0 else text.rjust(width))
     return '  '.join(cells)
 
 
@@ -1867,28 +1863,13 @@ def show_overview_row(domain, result):
     total = result['total']
     known = bool(result.get('read', 0))
     percent = lambda key: f'{100*result["counts"][key]/total:.1f}' if total else 'N/D'
-    flags = []
-    if not known or not total:
-        flags.append('SIN FECHA')
-    elif signals(result):
-        flags.append('REV:' + str(len(signals(result))))
-    else:
-        flags.append(activity_level(result.get('peak', 0)))
-    if result.get('rapid'):
-        flags.append('M')
-    ordinary = ('VISTA RÁPIDA:', 'Se omiten ', 'Vista rápida: cola', 'Límite de tiempo/bytes', 'Quedan archivos sin leer',
-                'Selección por fechas de extractos:', 'Búsqueda rápida por fecha:', 'Candidato gzip elegido por fecha inicial;')
-    if any(not note.startswith(ordinary) for note in result['notes']):
-        flags.append('A')
     triage = result.get('triage', {})
     notice_count = str(triage['count']) + ('*' if triage.get('partial') else '') if triage else 'N/D'
     print(overview_line((domain, f'{total:,}' if known and total else 'N/D',
                          f'{result["bytes"]/1048576:.2f}' if known and total else 'N/D',
                          unique_text((result.get('unique_ips') or {}).get('all')) if total else 'N/D',
                          percent('bot'), percent('probable'), percent('unknown'),
-                         f'{result.get("http4", 0):,}' if total else 'N/D',
-                         f'{result.get("http5", 0):,}' if total else 'N/D',
-                         f'{result.get("peak", 0):,}' if total else 'N/D', '/'.join(flags),
+                         f'{result.get("peak", 0):,}' if total else 'N/D',
                          notice_count,
                          result.get('triage', {}).get('priority', 'SIN DATOS'))), flush=True)
 
@@ -2097,11 +2078,10 @@ class HtmlAudit:
         complete = len(rows) == self.total and self.domains == self.total and not self.truncated
         status = 'Recorrido terminado' if complete else 'INFORME PARCIAL: recorrido interrumpido o límite de tamaño alcanzado'
         footer = '<section><h2>Resumen final · ' + status + '</h2><p>' + str(len(rows)) + '/' + str(self.total) + ' dominios consultados.</p>'
-        footer += '<h3>DOMINIOS QUE REQUIEREN ATENCIÓN</h3><p>Primero prioridad y número de avisos agrupados; después salud web, impacto potencial y tráfico sospechoso. Hechos, hipótesis y pasos de revisión en el apartado de cada dominio.</p>'
         attention = sorted((r for r in rows if requires_attention(r[1])), key=diagnosis_key)
-        footer += html_table(ATTENTION_HEADERS, [attention_values(*row) for row in attention[:100]])
-        if not attention:
-            footer += '<p>Sin condiciones activadas en la lectura; no descarta problemas ni falta de datos.</p>'
+        if attention:
+            footer += '<h3>DOMINIOS QUE REQUIEREN ATENCIÓN</h3>'
+            footer += html_table(ATTENTION_HEADERS, [attention_values(*row) for row in attention[:100]])
         shared = getattr(self.args, 'shared', None)
         if shared and shared.findings():
             footer += '<h3>POSIBLE INCIDENCIA COMPARTIDA DEL SERVIDOR</h3>' + html_table(
@@ -2135,9 +2115,9 @@ def collect_ranked(root, domains, day, zone, args):
     rows = []
     args.shared = SharedIncidents(getattr(args, 'thresholds', THRESHOLDS))
     print('\nUna fila por dominio. Peticiones/porcentajes se refieren a los accesos leídos del período.')
-    print('MiB = contenido enviado; NAV. = navegador aparente, no humano demostrado; DESC. = sin identificar; 4xx/5xx = respuestas.')
-    print('ESTADO: REV:n = umbrales activados; M = muestra, no total diario; A = avisos; SIN FECHA = sin accesos de la fecha.')
-    print('BAJA/MODERADA/ALTA = volumen orientativo del pico; no confirma ni descarta ataques.')
+    print('MiB = contenido enviado; NAV. = navegador aparente, no humano demostrado; DESC. = sin identificar.')
+    print('MÁX. PET/MIN = mayor número de peticiones leídas en un minuto concreto; no es la tasa actual ni un umbral de ataque.')
+    print('Cifras de la muestra, sin extrapolar al período completo. N/D = sin datos suficientes en la lectura.')
     print('Para explicaciones, rutas, IP y avisos completos: ejecuta el comando indicando un dominio.')
     print('AVISOS = problemas agrupados, no líneas de log; PRIORIDAD orienta la revisión, no confirma un ataque.')
     print('* junto a AVISOS = diagnóstico adicional parcial. CPU de procesos: captura inicial, no lectura en directo de toda la tabla.')
@@ -2170,17 +2150,14 @@ def collect_ranked(root, domains, day, zone, args):
             overview_progress()
             print('\nLectura interrumpida: mostraré el resumen de los dominios ya terminados.', flush=True)
             break
-    rows.sort(key=traffic_key)
-    print('\n' + '=' * 80)
-    print(f' TABLA FINAL · MÁS A MENOS PETICIONES LEÍDAS · {len(rows)}/{len(domains)} dominios')
-    print('=' * 80)
+    print(f'\nRecorrido: {len(rows)}/{len(domains)} dominios consultados.')
     if len(rows) < len(domains):
-        print(f'{len(domains) - len(rows)} dominios pendientes; no están incluidos en el ranking.')
+        print(f'{len(domains) - len(rows)} dominios pendientes; no están incluidos en el resumen.')
     return rows
 
 
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(description='Audithor — steev anderson. Filas progresivas, tabla final por tráfico y diagnóstico de salud/impacto potencial.',
+    parser = argparse.ArgumentParser(description='Audithor — steev anderson. Tabla progresiva y resumen de dominios que requieren atención.',
                                      epilog='Diagnóstico basado en lo leído, sin atribuir CPU/RAM. Umbrales: ' +
                                      ', '.join(f'{key}={value:g}' for key, value in THRESHOLDS.items()))
     parser.add_argument('--version', action='version', version='Audithor ' + VERSION)
@@ -2473,14 +2450,6 @@ def run_analysis(args):
             return 0
         rows = collect_ranked(root, domains, args.day, args.zone, args)
         finish_audit(args, rows)
-        for offset in range(0, len(rows), PAGE_SIZE):
-            show_overview_header()
-            for domain, summary in rows[offset:offset+PAGE_SIZE]:
-                show_overview_row(domain, summary)
-            if offset + PAGE_SIZE >= len(rows) or args.once or args.report or not sys.stdin.isatty():
-                break
-            if input(f'\nEnter: siguientes {PAGE_SIZE} | q + Enter: salir > ').strip().lower() in ('q', 'salir'):
-                break
         show_attention(rows, args.shared)
     finally:
         if args.audit:

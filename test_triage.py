@@ -324,6 +324,18 @@ class TriageTests(unittest.TestCase):
             else:
                 self.assertIn('2*',output.getvalue())
                 self.assertIn('AVISOS',output.getvalue())
+                self.assertEqual(output.getvalue().count('IP ÚNICAS'),1)
+                self.assertNotIn('TABLA FINAL',output.getvalue())
+                self.assertNotIn('    Detalle:',output.getvalue())
+                self.assertNotIn('Sin coincidencias compartidas',output.getvalue())
+
+    def test_no_findings_prints_no_empty_attention_sections(self):
+        r=result(); r['diagnosis']=a.diagnose_domain(r)
+        r['triage']=t.diagnose('example.com',r,self.snapshot(),args())
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output):
+            a.show_attention([('example.com',r)],a.SharedIncidents())
+        self.assertEqual(output.getvalue(),'')
 
 
 if __name__=='__main__':
