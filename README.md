@@ -1,6 +1,6 @@
-# Audithor 0.12.2
+# Audithor 0.13.0
 
-La versión 0.12.2 aclara qué límite de comportamiento se ha alcanzado y evita las tablas vacías de vigilancia. Conserva la corrección del arranque y los límites de seguridad.
+La 0.13 añade un resumen práctico: **avisos, prioridad y qué revisar en cada dominio**, cruzando errores ya registrados con una muestra breve de procesos actuales. No corrige webs ni desactiva plugins por su cuenta.
 
 Creado por **steev anderson**.
 
@@ -29,7 +29,39 @@ Va **dominio a dominio** y muestra una fila al terminar cada uno. Después de 70
 
 Al acabar repite la tabla **de más a menos peticiones**, usando los resultados que ya tiene. No vuelve a leer los logs para ordenarla.
 
-Después añade **DOMINIOS QUE REQUIEREN ATENCIÓN**, con prioridad por salud, impacto potencial y tráfico sospechoso. El detalle explica qué ha visto, qué podría estar pasando y qué revisar en Plesk. El HTML incluye lo mismo.
+Después añade **DOMINIOS QUE REQUIEREN ATENCIÓN**, primero por prioridad y número de avisos agrupados y después por salud, impacto potencial y tráfico sospechoso. El detalle explica qué ha visto, qué podría estar pasando y qué revisar en Plesk. El HTML incluye lo mismo.
+
+## Avisos y prioridad por dominio
+
+Sube también **`audithor_triage.py`** junto a `audithor.py` y `audithor_watch.py`. El código debe seguir siendo privado y no modificable por las cuentas de las webs.
+
+```bash
+python3 -I -B audithor.py                         # tabla de dominios, AVISOS y PRIORIDAD
+python3 -I -B audithor.py escaparatedigital.com    # desglose y procesos actuales
+python3 -I -B audithor.py ejemplo.com --yesterday  # errores del período, sin procesos de ahora
+```
+
+Por ejemplo, un pool que alcanza su límite y un fallo repetido al guardar tareas de WordPress pueden dar **2 avisos · ALTA**. Las líneas repetidas se agrupan: veinte mensajes de cron no se convierten en veinte problemas. El consumo actual de CPU del mismo pool se añade como evidencia del aviso de capacidad, sin duplicarlo. No se afirma que el cron causara la carga.
+
+Cada aviso separa evidencia, número de mensajes, primera/última hora observadas, fuente, posible explicación y qué revisar. Si el mensaje incluye archivo PHP y línea, conserva hasta tres ejemplos de nombre y línea, sin la ruta completa ni el mensaje crudo. La prioridad es orientativa; no identifica al culpable de una caída ni confirma un ataque.
+
+Se revisan estas fuentes, **sin ejecutarlas ni modificarlas**:
+
+- Una sola lectura de las colas de `/var/log/plesk-phpNN-fpm/error.log`, como máximo 16 versiones. Solo asigna mensajes con `[pool DOMINIO]` a los dominios del recorrido. No consulta bases de datos ni ejecuta WordPress.
+- Las colas activas `error_log`, `proxy_error_log`, `php_error.log` y `php_error_log` del dominio. Lee ambas capas para no perder errores PHP/Apache al elegir accesos nginx. Los accesos siguen usando una sola capa para evitar duplicarlos.
+- Para **hoy**, dos muestras de `/proc`, con una pausa de 0,5 s y atribución por el título exacto `php-fpm: pool DOMINIO`. No atribuye por usuario, que puede compartirse entre webs. MySQL, Apache, nginx y estadísticas aparecen aparte como servicios comunes, sin asignarlos a un dominio.
+
+Reconoce límites de pool y memoria, cron que no se puede guardar, advertencias de valores ausentes, errores fatales, problemas SQL, permisos y timeouts/backend. Conserva también las señales anteriores de HTTP, exploración y posibles exposiciones. No lee cuerpos POST, secretos, trazas completas ni argumentos arbitrarios de procesos. Un nombre de tarea como `sby_feed_update` es una pista para confirmar el plugin, no una causa demostrada.
+
+**ALTA**: límite de pool/memoria, error fatal, al menos tres mensajes de fallo de cron, CPU del pool de al menos 100% de un núcleo durante la muestra, o señales altas del diagnóstico anterior. **MEDIA**: CPU desde 50%, advertencias repetidas desde cinco mensajes y otros errores de backend/cron/SQL. Una advertencia aislada queda BAJA. Sin evidencia suficiente puede salir SIN DATOS. Son criterios de revisión, no umbrales de ataque.
+
+La CPU se calcula entre muestras de los mismos PID y tiempo de inicio; se descartan procesos nuevos, desaparecidos o PID reutilizados. **100% equivale a un núcleo**, no al servidor entero. RSS incluye páginas compartidas: no se suma como RAM exclusiva. Se muestran hasta diez PID por pool; contar procesos no dice cuántos atendían peticiones ni cuánto duraba una de ellas. La captura se hace al principio y muestra su hora; no se actualiza mientras pasan los dominios.
+
+El presupuesto adicional es compartido: hasta **2 s/1 MiB** para logs PHP-FPM globales y **2 s/1 MiB/512 procesos por muestra** para la captura de procesos (1 MiB compartido entre ambas muestras). Por dominio añade hasta **0,5 s/256 KiB** de errores activos. Los topes de bytes son del contenido solicitado; el buffer de lectura puede adelantar pequeños bloques, contabilizados por el límite bruto global. Se mantienen los límites efectivos de 128 MiB de memoria virtual, CPU, tiempo y lectura global; no se amplían con esta versión. La lectura adicional se suspende si hay menos de 256 MiB disponibles o carga mayor que el máximo de 4 y dos veces las CPU lógicas.
+
+Hasta 512 dominios reciben este cruce adicional; el recorrido de accesos mantiene sus límites y paginación. Cada dominio retiene hasta 16 clases de avisos. Un `*` junto al número de avisos significa diagnóstico adicional parcial. No ejecuta análisis en paralelo, monitor continuo, búsquedas recursivas ni lecturas de gzip como parte de este cruce.
+
+**Cobertura:** son colas de archivos activos. Un error de ayer puede haber rotado y quedar fuera de este diagnóstico, aunque el análisis de accesos sí consulte gzip. Mensajes duplicados entre Apache y PHP-FPM pueden aumentar la frecuencia observada: no son incidentes únicos ni peticiones. Los logs sin offset se interpretan con la zona local del host y se convierten a la elegida; si el log usa otra zona, hay que contrastarla. No cambia la zona del servidor. En consultas históricas y semanales se omiten procesos actuales. Ausencia de avisos no demuestra ausencia de problemas.
 
 ## Vigilar un dominio en directo con --watch
 
@@ -237,7 +269,7 @@ También lee **Fail2Ban** desde `/var/log/fail2ban.log`. Cuenta eventos `Ban` y 
 
 Elige archivos por fechas de extractos: `.1.gz` no tiene por qué ser ayer. Muestra los archivos seleccionados, los MiB leídos y las fechas encontradas. Puedes cambiar la ruta con `--fail2ban-log /ruta/al/log` u omitirlo con `--no-fail2ban`.
 
-La tabla global normal no lee Fail2Ban ni los mensajes internos de errores. RAM y CPU históricas por dominio tampoco aparecen: estos logs no permiten reconstruirlas.
+La tabla global normal no lee Fail2Ban. Ahora sí consulta extractos acotados de errores para los avisos por dominio; no son un recuento completo. RAM y CPU históricas por dominio tampoco aparecen: estos logs no permiten reconstruirlas.
 
 ### Fail2Ban activo, opcional
 
@@ -332,7 +364,7 @@ python3 -B -m unittest -q
 
 Hay pruebas locales de fechas, selección de logs, límites, tablas, informes y Fail2Ban. Algunas comprobaciones de permisos y enlaces necesitan Linux. Esto no sustituye comprobar los resultados con los logs de tu servidor.
 
-Para 0.12.2: 131 pruebas, 125 correctas y 6 omitidas porque requieren Linux. Las pendientes comprueban descriptores/enlaces/permisos, permisos de informes, límites reales del kernel/bloqueo/temporizador, entrada bruta, privacidad de `data/` e inotify real. Las pruebas de watch usan SQLite y logs temporales: EOF, rotación, truncamiento, copias repetidas, PHP/SQL/nginx/PHP-FPM, secretos, presión, Ctrl+C, cola llena, SQLite lleno/ocupado, retención y ausencia de logs. No se han ejecutado pruebas en los dominios del servidor ni consultas a un Fail2Ban real.
+Para 0.13.0: 160 pruebas, 154 correctas y 6 omitidas porque requieren Linux. Las pendientes comprueban descriptores/enlaces/permisos, permisos de informes, límites reales del kernel/bloqueo/temporizador, entrada bruta, privacidad de `data/` e inotify real. Las pruebas de watch usan SQLite y logs temporales: EOF, rotación, truncamiento, copias repetidas, PHP/SQL/nginx/PHP-FPM, secretos, presión, Ctrl+C, cola llena, SQLite lleno/ocupado, retención y ausencia de logs. El diagnóstico adicional reproduce el caso de dos avisos, filtra por pool y período, respeta zonas horarias, descarta PID reutilizados, limita estructuras y lecturas, y comprueba cobertura parcial, ambas capas, HTML y presión alta. No se han ejecutado pruebas en los dominios del servidor ni consultas a un Fail2Ban real.
 
 Comparación local con 0.10.0 sobre 12.000 accesos: ambas versiones leyeron 1.396.357 bytes y encontraron las mismas peticiones. Mediana de tres recorridos: 0,5000 s CPU antes y 0,5469 s después; pico de asignaciones Python de 449,9 a 460,8 KiB. Es una prueba pequeña con una IP repetida, lector adaptado a Windows y pausas/estado del host simulados. No mide RSS ni predice el coste con miles de IP; los topes de estructuras y los límites de ejecución controlan esos casos.
 

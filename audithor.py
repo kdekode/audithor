@@ -36,7 +36,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.12.2'
+VERSION = '0.13.0'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -1328,7 +1328,13 @@ class SharedIncidents:
 def diagnosis_key(row):
     domain, result = row
     d = result.get('diagnosis') or diagnose_domain(result)
-    return tuple(-v for v in d['priority']) + (-result.get('http5', 0), domain)
+    rank = {'SIN DATOS': -1, 'SIN AVISOS': 0, 'BAJA': 1, 'MEDIA': 2, 'ALTA': 3}
+    triage = result.get('triage', {})
+    return (-rank.get(triage.get('priority'), 0), -triage.get('count', 0)) + tuple(-v for v in d['priority']) + (-result.get('http5', 0), domain)
+
+
+def requires_attention(result):
+    return bool(result.get('triage', {}).get('count')) or (result.get('diagnosis') or diagnose_domain(result))['attention']
 
 
 def attention_values(domain, result):
@@ -1336,10 +1342,11 @@ def attention_values(domain, result):
     total = result.get('total', 0)
     return (domain, total, result.get('http4', 0), result.get('http5', 0),
             f'{100*result.get("http5", 0)/total:.1f}%' if total else 'N/D', result.get('peak', 0),
-            d['health'], d['suspicious'], d['impact'])
+            d['health'], d['suspicious'], d['impact'], result.get('triage', {}).get('count', 'N/D'),
+            result.get('triage', {}).get('priority', 'SIN DATOS'))
 
 
-ATTENTION_HEADERS = ('DOMINIO', 'PETICIONES', '4xx', '5xx', '%5xx', 'PICO/MIN', 'SALUD WEB', 'SOSPECHOSO', 'IMPACTO POTENCIAL')
+ATTENTION_HEADERS = ('DOMINIO', 'PETICIONES', '4xx', '5xx', '%5xx', 'PICO/MIN', 'SALUD WEB', 'SOSPECHOSO', 'IMPACTO POTENCIAL', 'AVISOS', 'PRIORIDAD')
 
 
 def show_diagnosis(d):
@@ -1357,13 +1364,18 @@ def show_diagnosis(d):
 
 def show_attention(rows, shared=None):
     print('\nDOMINIOS QUE REQUIEREN ATENCIÓN · solo esta ejecución y servidor')
-    selected = sorted((r for r in rows if (r[1].get('diagnosis') or diagnose_domain(r[1]))['attention']), key=diagnosis_key)
-    table(ATTENTION_HEADERS, [attention_values(*r) for r in selected[:100]], (32, 10, 7, 7, 7, 8, 13, 13, 17))
+    selected = sorted((r for r in rows if requires_attention(r[1])), key=diagnosis_key)
+    table(ATTENTION_HEADERS, [attention_values(*r) for r in selected[:100]], (32, 10, 7, 7, 7, 8, 13, 13, 17, 6, 11))
     if not selected:
         print('  Sin condiciones activadas en los datos leídos; no descarta problemas ni falta de cobertura.')
     for domain, result in selected[:100]:
         print('\n  ' + domain)
-        show_diagnosis(result.get('diagnosis') or diagnose_domain(result))
+        if 'triage' in result:
+            for issue in result['triage']['issues']:
+                print('    ' + issue['priority'] + ' · ' + issue['title'])
+            print('    Detalle: python3 -I -B audithor.py ' + domain + ' (añade el mismo período si era histórico).')
+        else:
+            show_diagnosis(result.get('diagnosis') or diagnose_domain(result))
     if len(selected) > 100:
         print('  Se muestran los primeros 100; consulta el detalle del resto por dominio.')
     if shared:
@@ -1754,6 +1766,8 @@ def show(domain, day, result, detail=False):
         for note in sorted(result['notes']):
             print('    - ' + note)
     if detail:
+        if 'triage' in result:
+            triage_module().show(result['triage'], sys.modules[__name__])
         show_observation_detail(result)
         if result.get('active_matches') is not None:
             print(f'  IP de esta lectura coincidentes con bloqueos ACTIVOS AHORA: {result["active_matches"]} (solo IP rastreadas; no bloqueos del período).')
@@ -1802,6 +1816,8 @@ def compact_summary(result):
     summary['peak_minute'] = result.get('peak_minute')
     summary['f2b_matches'] = result.get('f2b_matches')
     summary['diagnosis'] = result.get('diagnosis') or diagnose_domain(result)
+    if 'triage' in result:
+        summary['triage'] = result['triage']
     for key in ('unique_ips', 'observed_days', 'coverage', 'suspect_requests', 'indeterminate_requests', 'behavior_partial', 'suspect_ip_count'):
         summary[key] = result.get(key)
     summary['counts'] = collections.Counter({key: result['counts'][key] for key in ('bot', 'probable', 'unknown')})
@@ -1828,7 +1844,7 @@ def traffic_key(row):
 OVERVIEW_COLUMNS = (
     ('DOMINIO', 32), ('PETICIONES', 10), ('MiB', 9), ('IP ÚNICAS', 10), ('BOTS %', 7),
     ('NAV. %', 7), ('DESC. %', 7), ('4xx (#)', 7), ('5xx (#)', 7),
-    ('PICO/MIN', 8), ('ESTADO', 14),
+    ('PICO/MIN', 8), ('ESTADO', 14), ('AVISOS', 6), ('PRIORIDAD', 11),
 )
 
 
@@ -1864,13 +1880,17 @@ def show_overview_row(domain, result):
                 'Selección por fechas de extractos:', 'Búsqueda rápida por fecha:', 'Candidato gzip elegido por fecha inicial;')
     if any(not note.startswith(ordinary) for note in result['notes']):
         flags.append('A')
+    triage = result.get('triage', {})
+    notice_count = str(triage['count']) + ('*' if triage.get('partial') else '') if triage else 'N/D'
     print(overview_line((domain, f'{total:,}' if known and total else 'N/D',
                          f'{result["bytes"]/1048576:.2f}' if known and total else 'N/D',
                          unique_text((result.get('unique_ips') or {}).get('all')) if total else 'N/D',
                          percent('bot'), percent('probable'), percent('unknown'),
                          f'{result.get("http4", 0):,}' if total else 'N/D',
                          f'{result.get("http5", 0):,}' if total else 'N/D',
-                         f'{result.get("peak", 0):,}' if total else 'N/D', '/'.join(flags))), flush=True)
+                         f'{result.get("peak", 0):,}' if total else 'N/D', '/'.join(flags),
+                         notice_count,
+                         result.get('triage', {}).get('priority', 'SIN DATOS'))), flush=True)
 
 
 def overview_progress(text=''):
@@ -1947,6 +1967,8 @@ def html_section(domain, result, args):
         ('Fechas encontradas en los logs', f'{result.get("earliest")} a {result.get("latest")}'),
     ]
     output = '<section><h2>' + esc(domain) + '</h2>' + html_table(('Métrica', 'Resultado'), metrics)
+    if 'triage' in result:
+        output += triage_module().render_html(result['triage'], sys.modules[__name__])
     output += '<h3>IP únicas y comportamiento</h3>' + html_table(('Medida', 'Valor'), observation_rows(result))
     output += '<p>' + esc(result.get('coverage', coverage_text(result))) + '</p>'
     output += '<p>IP no equivale a visitante. Categorías de IP solapadas. ~ = estimación HLL (2048 registros, error típico ~2,3%, no garantizado). Exacto hasta 1024 IP de la lectura. Comportamiento: primeras 1024 IP, 32 rutas/64 minutos por IP; hasta 20 hallazgos. No hay probabilidades de humanidad.</p>'
@@ -2075,8 +2097,8 @@ class HtmlAudit:
         complete = len(rows) == self.total and self.domains == self.total and not self.truncated
         status = 'Recorrido terminado' if complete else 'INFORME PARCIAL: recorrido interrumpido o límite de tamaño alcanzado'
         footer = '<section><h2>Resumen final · ' + status + '</h2><p>' + str(len(rows)) + '/' + str(self.total) + ' dominios consultados.</p>'
-        footer += '<h3>DOMINIOS QUE REQUIEREN ATENCIÓN</h3><p>Prioridad: salud web, impacto potencial y tráfico sospechoso; después número de 5xx. Hechos, hipótesis y pasos de revisión en el apartado de cada dominio.</p>'
-        attention = sorted((r for r in rows if (r[1].get('diagnosis') or diagnose_domain(r[1]))['attention']), key=diagnosis_key)
+        footer += '<h3>DOMINIOS QUE REQUIEREN ATENCIÓN</h3><p>Primero prioridad y número de avisos agrupados; después salud web, impacto potencial y tráfico sospechoso. Hechos, hipótesis y pasos de revisión en el apartado de cada dominio.</p>'
+        attention = sorted((r for r in rows if requires_attention(r[1])), key=diagnosis_key)
         footer += html_table(ATTENTION_HEADERS, [attention_values(*row) for row in attention[:100]])
         if not attention:
             footer += '<p>Sin condiciones activadas en la lectura; no descarta problemas ni falta de datos.</p>'
@@ -2087,7 +2109,7 @@ class HtmlAudit:
             footer += '<p>Hipótesis para investigar servicios comunes; no demuestra un aumento ni una causa compartida. Solo dominios de esta ejecución/servidor.</p>'
         if shared and shared.partial:
             footer += '<p>Correlación parcial por límites: 2048 minutos, 8 dominios/grupo.</p>'
-        footer += '<p>Hasta 100 dominios destacados y 20 coincidencias; muestras pueden ocultar problemas. No atribuye CPU/RAM.</p></section></body></html>'
+        footer += '<p>Hasta 100 dominios destacados y 20 coincidencias; muestras pueden ocultar problemas. CPU/RSS de procesos solo en la instantánea actual; no son métricas históricas ni memoria exclusiva.</p></section></body></html>'
         self.write(footer, closing=True)
         self.stream.close()
         self.finished = True
@@ -2117,6 +2139,8 @@ def collect_ranked(root, domains, day, zone, args):
     print('ESTADO: REV:n = umbrales activados; M = muestra, no total diario; A = avisos; SIN FECHA = sin accesos de la fecha.')
     print('BAJA/MODERADA/ALTA = volumen orientativo del pico; no confirma ni descarta ataques.')
     print('Para explicaciones, rutas, IP y avisos completos: ejecuta el comando indicando un dominio.')
+    print('AVISOS = problemas agrupados, no líneas de log; PRIORIDAD orienta la revisión, no confirma un ataque.')
+    print('* junto a AVISOS = diagnóstico adicional parcial. CPU de procesos: captura inicial, no lectura en directo de toda la tabla.')
     for number, domain in enumerate(domains, 1):
         try:
             if number > 1 and (number - 1) % PAGE_SIZE == 0 and not next_batch(args):
@@ -2132,6 +2156,7 @@ def collect_ranked(root, domains, day, zone, args):
                 wait_for_capacity(args.gentle, time.monotonic() + 30)
             overview_progress(f'[{number}/{len(domains)}] Leyendo {domain}…')
             result = analyze(root, domain, day, zone, args)
+            attach_triage(domain, result, args)
             overview_progress()
             args.shared.add(domain, result)
             if getattr(args, 'audit', None):
@@ -2252,6 +2277,64 @@ def arguments(argv=None):
 
 
 _WATCH_MODULE = None
+_TRIAGE_MODULE = None
+
+
+def triage_module():
+    """Módulo privado vecino; compatible con -I y sin cambiar sys.path."""
+    global _TRIAGE_MODULE
+    if _TRIAGE_MODULE is None:
+        folder = directory(os.path.dirname(os.path.abspath(__file__)))
+        try:
+            with regular(folder, 'audithor_triage.py') as stream:
+                info = os.fstat(stream.fileno())
+                if info.st_uid not in (0, os.geteuid()) or stat.S_IMODE(info.st_mode) & 0o022:
+                    raise RuntimeError('audithor_triage.py debe ser código privado y no modificable por otras cuentas.')
+                source = stream.read(128 * 1024 + 1)
+                if len(source) > 128 * 1024:
+                    raise RuntimeError('Módulo diagnóstico supera el tamaño permitido.')
+        finally:
+            os.close(folder)
+        module = types.ModuleType('audithor_triage_private')
+        try:
+            exec(compile(source, 'audithor_triage.py', 'exec'), module.__dict__)
+        except (ImportError, SyntaxError) as exc:
+            raise RuntimeError('Actualiza audithor_triage.py junto al script principal.') from exc
+        _TRIAGE_MODULE = module
+    return _TRIAGE_MODULE
+
+
+def attach_triage(domain, result, args):
+    snapshot = getattr(args, 'triage_snapshot', None)
+    if snapshot is None:
+        return
+    module = triage_module()
+    extra = dict(snapshot)
+    extra['logs'] = dict(snapshot.get('logs', {}))
+    extra['logs'][domain] = {key: dict(item, sources=list(item['sources'])) for key, item in snapshot.get('logs', {}).get(domain, {}).items()}
+    extra['notes'] = list(snapshot.get('notes', []))
+    if not pressure(args.gentle, rapid=True):
+        root = directory(args.root)
+        try:
+            local = module.domain_errors(root, domain, args, sys.modules[__name__])
+        finally:
+            os.close(root)
+        extra['partial'] = extra.get('partial', False) or local['partial']
+        for key, item in local['domains'].get(domain, {}).items():
+            existing = extra['logs'][domain].get(key)
+            if existing:
+                existing['count'] += item['count']
+                existing['first'] = min(existing['first'], item['first'])
+                existing['last'] = max(existing['last'], item['last'])
+                existing['sources'] = sorted(set(existing['sources'] + item['sources']))[:4]
+                existing['locations'] = sorted(set(existing.get('locations', []) + item.get('locations', [])))[:3]
+            else:
+                extra['logs'][domain][key] = item
+        extra['notes'].append('Errores del dominio: colas activas de ambas capas y PHP; hasta 0,5 s/256 KiB. Mensajes pueden repetirse entre fuentes; no cuentan peticiones ni incidentes independientes.')
+    else:
+        extra['partial'] = True
+        extra['notes'].append('Lectura adicional de errores suspendida por presión; cobertura incompleta.')
+    result['triage'] = module.diagnose(domain, result, extra, args, sys.modules[__name__])
 
 
 def watch_module():
@@ -2328,7 +2411,7 @@ def run_analysis(args):
     if args.report:
         print('Modo auditoría: todos los dominios seleccionados, sin esperar start; HTML privado en reports/.')
     print('Bots declarados, navegadores aparentes y señales de comportamiento no identifican personas ni confirman ataques.')
-    print('Diagnóstico: salud, tráfico sospechoso e impacto potencial; sin atribución de CPU/RAM.')
+    print('Diagnóstico: avisos por dominio, salud, tráfico e impacto. CPU/RSS solo de procesos actuales identificados por pool; sin historial de recursos.')
     if args.threshold:
         print('Umbrales personalizados: ' + ', '.join(args.threshold))
     if args.historical:
@@ -2352,6 +2435,18 @@ def run_analysis(args):
         if not domains:
             print('No se encontraron dominios accesibles.')
             return 0
+        print('\nPreparando diagnóstico acotado: logs PHP-FPM y una instantánea de procesos; sin ejecutar PHP ni consultar bases de datos.', flush=True)
+        try:
+            args.triage_snapshot = triage_module().capture(args, sys.modules[__name__], domains)
+        except (OSError, RuntimeError, ValueError):
+            args.triage_snapshot = None
+            print('  Diagnóstico adicional N/D: comprueba audithor_triage.py, sus permisos y versión. Continúa el análisis de accesos.')
+        for note in (args.triage_snapshot or {}).get('notes', []):
+            print('  Diagnóstico: ' + note)
+        if (args.triage_snapshot or {}).get('server'):
+            print('  Procesos ACTUALES de servicios comunes (no atribuidos a ninguna web):')
+            table(('SERVICIO', 'PID', 'CPU % / NÚCLEO'),
+                  [(p['role'], p['pid'], p['cpu']) for p in args.triage_snapshot['server']['processes']], (24, 10, 16))
         args.bans = None
         args.active_bans = None
         if args.fail2ban_active:
@@ -2368,6 +2463,7 @@ def run_analysis(args):
         if args.domain:
             print('\nLeyendo ' + args.domain + '…', flush=True)
             result = analyze(root, args.domain, args.day, args.zone, args)
+            attach_triage(args.domain, result, args)
             result['watch_history'] = saved_history(args)
             result['watch_zone'] = args.zone
             show(args.domain, args.day, result, True)
