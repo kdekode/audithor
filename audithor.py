@@ -36,7 +36,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.13.1'
+VERSION = '0.14.0'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -1701,7 +1701,66 @@ def table(headers, rows, widths):
         print('  ' + row(values))
 
 
-def show(domain, day, result, detail=False):
+def show_brief(domain, day, result):
+    print('\n' + '=' * 76)
+    print(' ' + domain + ' | ' + str(result.get('period_label') or day))
+    print('=' * 76)
+    triage = result.get('triage')
+    if triage and triage.get('count'):
+        triage_module().show(triage, sys.modules[__name__])
+    elif triage:
+        print('  No se han detectado avisos en lo leído. No garantiza que la web esté bien.')
+        if triage.get('processes'):
+            triage_module().show(triage, sys.modules[__name__])
+    else:
+        print('  Diagnóstico PHP/procesos no disponible. No se puede descartar un problema.')
+        d = result.get('diagnosis') or diagnose_domain(result)
+        for action in d.get('actions', [])[:2]:
+            print(textwrap.fill(action, width=88, initial_indent='  Revisar: ', subsequent_indent='    '))
+    print('\n  TRÁFICO OBSERVADO · no es el total del período ni visitantes')
+    if result.get('read') and result.get('total'):
+        total = result['total']
+        print(f'  {total:,} peticiones | {unique_text((result.get("unique_ips") or {}).get("all"))} IP distintas | {result["bytes"]/1048576:.2f} MiB enviados')
+        print(f'  Máximo leído en un minuto: {result.get("peak", 0):,} peticiones' +
+              (' · ' + result['peak_minute'] if result.get('peak_minute') else ''))
+    else:
+        print('  N/D: no se encontraron accesos suficientes del período; no significa tráfico cero.')
+    for title, key in (('RUTAS MÁS SOLICITADAS', 'urls'), ('RUTAS CON ERRORES', 'errors')):
+        rows = result.get(key, collections.Counter()).most_common(3)
+        if rows:
+            print('\n  ' + title + ' · hasta 3 de la muestra')
+            for path, count in rows:
+                print(textwrap.fill(f'{count:,} peticiones · {path}', width=88, initial_indent='    ', subsequent_indent='      '))
+    transfers = result.get('bytes_urls', collections.Counter()).most_common(3)
+    if transfers:
+        print('\n  MÁS CONTENIDO ENVIADO · no mide CPU ni RAM')
+        for path, count in transfers:
+            print(textwrap.fill(f'{count/1048576:.2f} MiB · {path}', width=88, initial_indent='    ', subsequent_indent='      '))
+    matches = result.get('f2b_matches')
+    if matches:
+        print(f'\n  Fail2Ban: {matches} IP de esta lectura aparecen en eventos Ban del período.')
+        print('  No demuestra que esta web causara el bloqueo ni que siga activo.')
+    if result.get('active_matches') is not None:
+        print(f'  Fail2Ban ACTIVO AHORA: {result["active_matches"]} coincidencias entre las IP rastreadas.')
+    history = result.get('watch_history') or {}
+    if history.get('events') or history.get('sessions'):
+        print(f'\n  Vigilancia guardada: {len(history.get("events", []))} grupos de incidencias y {len(history.get("sessions", []))} sesiones disponibles.')
+        print('  Solo cubre los intervalos vigilados. Horas y evidencias con --verbose.')
+    print('\n  LECTURA PARCIAL: puede faltar tráfico o errores; las fuentes pueden repetir mensajes.')
+    if triage and any(any(marker in note for marker in ('N/D', 'presión', 'Raíz alternativa')) for note in triage.get('notes', [])):
+        print('  Faltan fuentes o mediciones de PHP/procesos. Consulta el motivo con --verbose.')
+    print('  Los nombres ocultos pueden agrupar varias rutas. CPU de ahora no explica errores pasados.')
+    # No ocultar fallos de acceso a fuentes bajo una advertencia genérica de muestreo.
+    for note in sorted(result.get('notes', [])):
+        if note.startswith(('No se puede abrir', 'No hay logs', 'No se pudo completar')):
+            print(textwrap.fill(note, width=88, initial_indent='  Fuente no disponible: ', subsequent_indent='    '))
+    print('  Más información: añade --verbose al mismo comando. No amplía la lectura.\n')
+
+
+def show(domain, day, result, detail=False, verbose=False):
+    if detail and not verbose:
+        show_brief(domain, day, result)
+        return
     total = result['total']
     known = bool(result.get('read', 0))
     pct = lambda k: f"{100 * result['counts'][k] / total:.1f}%" if total else 'N/D'
@@ -1764,7 +1823,7 @@ def show(domain, day, result, detail=False):
             print('    - ' + note)
     if detail:
         if 'triage' in result:
-            triage_module().show(result['triage'], sys.modules[__name__])
+            triage_module().show(result['triage'], sys.modules[__name__], verbose=True)
         show_observation_detail(result)
         if result.get('active_matches') is not None:
             print(f'  IP de esta lectura coincidentes con bloqueos ACTIVOS AHORA: {result["active_matches"]} (solo IP rastreadas; no bloqueos del período).')
@@ -1947,9 +2006,11 @@ def html_section(domain, result, args):
         ('Archivos de la muestra', ', '.join(result.get('selected_files', [])) or 'Lectura ampliada / sin selección disponible'),
         ('Fechas encontradas en los logs', f'{result.get("earliest")} a {result.get("latest")}'),
     ]
-    output = '<section><h2>' + esc(domain) + '</h2>' + html_table(('Métrica', 'Resultado'), metrics)
+    output = '<section><h2>' + esc(domain) + '</h2>'
     if 'triage' in result:
         output += triage_module().render_html(result['triage'], sys.modules[__name__])
+    output += '<details' + (' open' if getattr(args, 'verbose', False) else '') + '><summary>Ver tráfico, códigos HTTP, IP y fuentes técnicas</summary>'
+    output += html_table(('Métrica', 'Resultado'), metrics)
     output += '<h3>IP únicas y comportamiento</h3>' + html_table(('Medida', 'Valor'), observation_rows(result))
     output += '<p>' + esc(result.get('coverage', coverage_text(result))) + '</p>'
     output += '<p>IP no equivale a visitante. Categorías de IP solapadas. ~ = estimación HLL (2048 registros, error típico ~2,3%, no garantizado). Exacto hasta 1024 IP de la lectura. Comportamiento: primeras 1024 IP, 32 rutas/64 minutos por IP; hasta 20 hallazgos. No hay probabilidades de humanidad.</p>'
@@ -1988,7 +2049,7 @@ def html_section(domain, result, args):
             output += watch_module().history_html(result['watch_history'], args.zone, sys.modules[__name__])
         except (OSError, RuntimeError, ValueError):
             output += '<p>Incidencias guardadas no disponibles; no implica ausencia de errores.</p>'
-    return output + '</section>'
+    return output + '</details></section>'
 
 
 def create_report_file(day, base=None):
@@ -2029,10 +2090,12 @@ class HtmlAudit:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <title>Audithor · auditoría de tráfico</title>
-<style>body{font:16px/1.6 system-ui,sans-serif;max-width:1050px;margin:auto;padding:24px;background:#f1f5f9;color:#172033}section{background:white;padding:24px;margin:24px 0;border:1px solid #cbd5e1;border-radius:10px}table{width:100%;border-collapse:collapse;overflow-wrap:anywhere}th,td{text-align:left;padding:10px;border-bottom:1px solid #ddd}th{background:#e2e8f0}h1,h2,h3{line-height:1.3}small{color:#475569}</style><body>
+<style>body{font:16px/1.6 system-ui,sans-serif;max-width:1050px;margin:auto;padding:24px;background:#f1f5f9;color:#172033}section{background:white;padding:24px;margin:24px 0;border:1px solid #cbd5e1;border-radius:10px}table{width:100%;border-collapse:collapse;overflow-wrap:anywhere}th,td{text-align:left;padding:10px;border-bottom:1px solid #ddd}th{background:#e2e8f0}h1,h2,h3{line-height:1.3}small{color:#475569}summary{cursor:pointer;font-weight:600;padding:12px 0}article{padding:4px 16px;margin:20px 0;border-left:4px solid #64748b}article.alta{border-color:#b91c1c}article.media{border-color:#a16207}article.baja{border-color:#475569}</style><body>
 <h1>Audithor · auditoría de tráfico</h1><p>Creado por steev anderson.</p>''')
         self.write('<p>Período analizado: ' + html.escape(str(getattr(args, 'period_label', args.day))) + ' · Zona: ' + html.escape(args.timezone) +
                    f' · Dominios seleccionados: {total} · Versión: {VERSION}</p>')
+        self.write('<p>Lectura parcial: los avisos orientan qué revisar, no confirman un ataque. Los problemas de cada dominio aparecen primero.</p>')
+        self.write('<details><summary>Ver metodología, límites y Fail2Ban del servidor</summary>')
         self.write('<p>Servidor de esta ejecución: ' + html.escape(getattr(args, 'server_label', 'servidor local')) +
                    '. Correlación limitada a este recorrido; no se importan resultados de otros servidores.</p>')
         self.write('<p>Umbrales de diagnóstico: ' + html.escape(', '.join(f'{k}={v:g}' for k, v in getattr(args, 'thresholds', THRESHOLDS).items())) + '</p>')
@@ -2058,6 +2121,7 @@ class HtmlAudit:
                        'Fechas locales de Fail2Ban sin offset; se presupone la zona elegida.</p>')
             self.write(html_table(('Jail', 'Eventos observados'), bans['jails'].most_common(20)))
             self.write('<ul>' + ''.join('<li>' + html.escape(clean(n, 500)) + '</li>' for n in sorted(bans['notes'])) + '</ul>')
+        self.write('</details>')
 
     def write(self, text, closing=False):
         size = len(text.encode('utf-8'))
@@ -2162,6 +2226,7 @@ def arguments(argv=None):
                                      ', '.join(f'{key}={value:g}' for key, value in THRESHOLDS.items()))
     parser.add_argument('--version', action='version', version='Audithor ' + VERSION)
     parser.add_argument('domain', nargs='?', help='Dominio exacto para informe detallado')
+    parser.add_argument('--verbose', action='store_true', help='Mostrar todas las tablas y fuentes técnicas; no amplía presupuestos ni lecturas')
     parser.add_argument('--watch', action='store_true', help='Vigilar manualmente solo eventos nuevos de un dominio; SQLite privado en data/')
     parser.add_argument('--watch-seconds', type=int, default=900, help='Duración manual máxima de --watch (1–3600 s; también rige --run-seconds)')
     dates = parser.add_mutually_exclusive_group()
@@ -2375,20 +2440,23 @@ def guarded_main(args):
 
 
 def run_analysis(args):
-    print(BANNER)
+    verbose = getattr(args, 'verbose', False)
+    if verbose:
+        print(BANNER)
     print('Audithor ' + VERSION)
     args.server_label = clean(os.uname().nodename, 120)
-    print('Servidor de esta ejecución: ' + args.server_label)
-    print(f'Período: {args.period_label} ({args.timezone}). Secuencial; memoria virtual máxima 128 MiB.')
-    print(f'Tandas de {args.seconds}s/{args.max_mib} MiB. ' + ('MUESTRA limitada por dominio.' if args.sample else 'LECTURA CONTINUA: descansa y continúa hasta finalizar los archivos seleccionados.'))
-    print(f'Límites efectivos: {args.run_seconds}s reales, {args.cpu_seconds}s CPU, {args.run_mib} MiB acumulados; una sola ejecución.')
+    print(args.server_label + ' | ' + args.period_label + ' | ' + args.timezone)
+    print(f'Solo lectura · lectura limitada · {args.seconds}s/{args.max_mib} MiB por tanda · memoria virtual máxima 128 MiB.')
+    if verbose:
+        print(f'Límites efectivos: {args.run_seconds}s reales, {args.cpu_seconds}s CPU, {args.run_mib} MiB acumulados; una sola ejecución.')
     if args.full:
         print(f'--full acotado por dominio: {max(30, args.seconds)}s / {max(64, args.max_mib)} MiB; puede terminar parcial.')
-    print('Logs en solo lectura. Sin instalaciones, cron ni cambios en Plesk, servicios o permisos de las webs.')
     if args.report:
         print('Modo auditoría: todos los dominios seleccionados, sin esperar start; HTML privado en reports/.')
-    print('Bots declarados, navegadores aparentes y señales de comportamiento no identifican personas ni confirman ataques.')
-    print('Diagnóstico: avisos por dominio, salud, tráfico e impacto. CPU/RSS solo de procesos actuales identificados por pool; sin historial de recursos.')
+    if verbose:
+        print('Logs en solo lectura. Sin cambios en Plesk, servicios, plugins ni permisos de las webs.')
+        print('Bots declarados y navegadores aparentes no identifican personas ni confirman ataques.')
+        print('CPU/RSS solo de procesos actuales identificados por pool; sin historial de recursos.')
     if args.threshold:
         print('Umbrales personalizados: ' + ', '.join(args.threshold))
     if args.historical:
@@ -2399,7 +2467,8 @@ def run_analysis(args):
         reason = pressure(args.gentle, rapid=True)
         if reason:
             raise RuntimeError(reason)
-        print('VISTA RÁPIDA: archivos probables de la fecha; límites por dominio, sin espera indefinida por carga.')
+        if verbose:
+            print('VISTA RÁPIDA: archivos probables de la fecha; límites por dominio, sin espera indefinida por carga.')
     else:
         wait_for_capacity(args.gentle, time.monotonic() + 30)
     root = directory(args.root)
@@ -2412,15 +2481,15 @@ def run_analysis(args):
         if not domains:
             print('No se encontraron dominios accesibles.')
             return 0
-        print('\nPreparando diagnóstico acotado: logs PHP-FPM y una instantánea de procesos; sin ejecutar PHP ni consultar bases de datos.', flush=True)
+        print('\nConsultando errores y procesos disponibles…', flush=True)
         try:
             args.triage_snapshot = triage_module().capture(args, sys.modules[__name__], domains)
         except (OSError, RuntimeError, ValueError):
             args.triage_snapshot = None
             print('  Diagnóstico adicional N/D: comprueba audithor_triage.py, sus permisos y versión. Continúa el análisis de accesos.')
-        for note in (args.triage_snapshot or {}).get('notes', []):
+        for note in ((args.triage_snapshot or {}).get('notes', []) if verbose else []):
             print('  Diagnóstico: ' + note)
-        if (args.triage_snapshot or {}).get('server'):
+        if verbose and (args.triage_snapshot or {}).get('server'):
             print('  Procesos ACTUALES de servicios comunes (no atribuidos a ninguna web):')
             table(('SERVICIO', 'PID', 'CPU % / NÚCLEO'),
                   [(p['role'], p['pid'], p['cpu']) for p in args.triage_snapshot['server']['processes']], (24, 10, 16))
@@ -2430,9 +2499,10 @@ def run_analysis(args):
             args.active_bans = read_active_fail2ban()
             show_active_fail2ban(args.active_bans)
         if args.domain or args.report:
-            print('\nLeyendo historial Fail2Ban…', flush=True)
+            if verbose and not args.no_fail2ban:
+                print('\nLeyendo historial Fail2Ban…', flush=True)
             args.bans = read_fail2ban(args)
-            if args.domain:
+            if args.domain and verbose:
                 show_fail2ban(args.bans, args.period_label)
         if args.report:
             args.audit = HtmlAudit(args, len(domains))
@@ -2443,7 +2513,7 @@ def run_analysis(args):
             attach_triage(args.domain, result, args)
             result['watch_history'] = saved_history(args)
             result['watch_zone'] = args.zone
-            show(args.domain, args.day, result, True)
+            show(args.domain, args.day, result, True, verbose=verbose)
             if args.audit:
                 args.audit.append(args.domain, result)
                 finish_audit(args, [(args.domain, compact_summary(result))])

@@ -5,6 +5,7 @@ import html
 import os
 import re
 import time
+import textwrap
 
 LEVEL = {'SIN DATOS': -1, 'SIN AVISOS': 0, 'BAJA': 1, 'MEDIA': 2, 'ALTA': 3}
 MAX_DOMAINS = 512
@@ -82,7 +83,7 @@ def log_signal(text):
     """Solo marcadores permitidos; nunca conservar mensajes crudos, SQL o argumentos."""
     low = text.lower()
     if 'max_children' in low and ('reached' in low or 'limit' in low):
-        return ('pool_limit', 'Pool PHP-FPM sin procesos disponibles', 'ALTA',
+        return ('pool_limit', 'PHP alcanzó su límite de procesos', 'ALTA',
                 'Se registró el límite max_children; no subirlo sin medir CPU y memoria.')
     if ('cron' in low and ('could_not_set' in low or 'could not be saved' in low)):
         hook = HOOK.search(text)
@@ -91,7 +92,7 @@ def log_signal(text):
         label = 'sby_feed_update' if name == 'sby_feed_update' else 'otro hook (oculto)'
         return ('cron', 'Fallo al guardar tareas de WordPress', 'MEDIA', 'WP-Cron: could_not_set; ' + label)
     if 'undefined array key' in low or 'trying to access array offset on null' in low:
-        return ('application_warning', 'Advertencias repetidas de aplicación', 'MEDIA',
+        return ('application_warning', 'Advertencias repetidas en el código de la web', 'MEDIA',
                 'PHP Warning: clave ausente o acceso a un valor nulo; no equivale a peticiones distintas.')
     if 'allowed memory size' in low and 'exhausted' in low:
         return ('php_memory', 'Límite de memoria PHP alcanzado', 'ALTA',
@@ -372,14 +373,14 @@ def capture(args, api, domains):
 
 def explanation(key):
     return {
-        'pool_limit': ('El pool no tenía un proceso libre al registrarse el aviso. Puede deberse a solicitudes lentas, tareas internas o tráfico.',
-                       'Revisar scripts lentos, cron y registros del pool en esa franja. No aumentar max_children sin medir.'),
+        'pool_limit': ('PHP había ocupado todos los procesos permitidos para esta web. Otras solicitudes podían quedar esperando; no demuestra un ataque.',
+                       'Revisar en Plesk los errores PHP y las tareas que coincidían con esas horas. No aumentar el límite sin identificar qué ocupaba los procesos.'),
         'cron': ('WordPress no pudo guardar la lista de tareas. Puede ser un fallo de persistencia o concurrencia; no demuestra que el plugin cause la carga.',
                  'Revisar el hook y los errores de WordPress/base de datos. sby_feed_update es una pista de YouTube Feed; confirmar el plugin instalado antes de actuar.'),
         'process_cpu': ('PHP-FPM consumía CPU en el intervalo medido. No identifica la petición, plugin o tarea, ni demuestra ataque.',
                         'Relacionar la hora con accesos y slowlog/estado del pool si ya están disponibles. No reiniciar ni bloquear por esta medición.'),
         'application_warning': ('La aplicación accede a valores ausentes o nulos. Muchos mensajes pueden proceder de una sola petición.',
-                                'Revisar validación del formulario o código señalado en los logs originales; no confundir mensajes con solicitudes.'),
+                                'Revisar la función y los datos que recibe el archivo/línea indicado, en los logs originales. Puede ser código propio, un plugin o módulo.'),
         'php_memory': ('Una ejecución PHP alcanzó su límite propio; no prueba agotamiento global de RAM.',
                        'Revisar el script y su tamaño de trabajo; no elevar memoria automáticamente.'),
         'php_fatal': ('Una ejecución PHP terminó con error; puede ser un fallo del código o de sus dependencias.',
@@ -437,32 +438,45 @@ def diagnose(domain, result, snapshot, args, api=None):
                 captured=snapshot.get('captured'), notes=list(snapshot.get('notes', [])), partial=snapshot.get('partial', True))
 
 
-def show(result, api):
+def show(result, api, verbose=False):
     if not result['issues'] and not result.get('processes'):
         return
     print('\n  RESUMEN PARA REVISAR · avisos agrupados por problema')
     print(f"  Avisos: {result['count']} | Prioridad: {result['priority']}")
+    if result['issues']:
+        print('  Empieza por: ' + result['issues'][0]['title'] + '.')
+    def say(label, message):
+        print(textwrap.fill(message, width=88, initial_indent='     ' + label, subsequent_indent='       '))
+    def clock(value):
+        try:
+            return dt.datetime.fromisoformat(value).strftime('%d/%m %H:%M %z')
+        except (TypeError, ValueError):
+            return 'hora no disponible'
     for n, row in enumerate(result['issues'], 1):
         print(f"\n  {n}. {row['title']} · {row['priority']} · {row['service']}")
-        print('     Evidencia: ' + row['evidence'])
+        say('Qué se ha visto: ', row['evidence'])
         if row['count'] is not None:
-            print(f"     {row['count']} mensajes observados, no peticiones; {row['first']} a {row['last']}.")
-        if row.get('current_evidence'):
-            print('     AHORA: ' + row['current_evidence'])
-        print('     Fuente: ' + ', '.join(row['sources']))
+            say('Cuándo: ', f"{clock(row['first'])} a {clock(row['last'])} · {row['count']} mensajes, no peticiones.")
+        if row.get('current_evidence') and verbose:
+            say('AHORA: ', row['current_evidence'])
+        if verbose:
+            say('Fuente: ', ', '.join(row['sources']))
         if row.get('locations'):
-            print('     PHP (solo nombre/línea observados): ' + ', '.join(row['locations']))
-        print('     Puede ser: ' + row['hypothesis'])
-        print('     Qué revisar: ' + row['action'])
+            say('Archivo y línea: ', ', '.join(row['locations']))
+        say('Qué puede significar: ', row['hypothesis'])
+        say('Qué revisar: ', row['action'])
     pool = result.get('processes')
     if pool:
         print('\n  PROCESOS ACTUALES · captura UTC ' + result['captured'])
-        api.table(('PID', 'CPU % / NÚCLEO', 'RSS MiB'),
-                  [(p['pid'], p['cpu'], p['rss_mib']) for p in pool['processes']], (10, 18, 12))
-        print('  RSS incluye páginas compartidas: no sumar como RAM exclusiva. Hasta 10 PID; no se guardan argumentos ni credenciales.')
-    for note in result['notes']:
-        print('  Cobertura: ' + note)
-    print('  Sin avisos no significa ausencia de problemas. Lecturas parciales pueden omitir incidencias.')
+        print(f"  {pool['count']} procesos medidos; CPU conjunta {pool['cpu']:.1f}% (100% = un núcleo).")
+        rows = pool['processes'] if verbose else [p for p in pool['processes'] if p['cpu'] >= 1][:3]
+        if rows:
+            api.table(('PID', 'CPU %', 'RSS MiB'), [(p['pid'], p['cpu'], p['rss_mib']) for p in rows], (10, 10, 12))
+            print('  RSS = memoria residente, incluye páginas compartidas; no sumar como RAM exclusiva.')
+    if verbose:
+        for note in result['notes']:
+            say('Cobertura: ', note)
+        print('  Sin avisos no significa ausencia de problemas. Lecturas parciales pueden omitir incidencias.')
 
 
 def render_html(result, api):
@@ -470,16 +484,20 @@ def render_html(result, api):
         return ''
     esc = html.escape
     output = '<h3>Resumen para revisar</h3><p>Avisos: ' + str(result['count']) + ' · Prioridad: ' + esc(result['priority']) + '</p>'
+    if result['issues']:
+        output += '<p><strong>Empieza por: ' + esc(result['issues'][0]['title']) + '.</strong></p>'
     for row in result['issues']:
-        output += '<h4>' + esc(row['title'] + ' · ' + row['priority']) + '</h4><p>' + esc(row['evidence']) + '</p>'
+        output += '<article class="' + esc(row['priority'].lower(), quote=True) + '"><h4>' + esc(row['title'] + ' · ' + row['priority']) + '</h4><p>Qué se ha visto: ' + esc(row['evidence']) + '</p>'
         if row['count'] is not None:
             output += '<p>' + esc(f"{row['count']} mensajes, no peticiones; {row['first']} a {row['last']}") + '</p>'
         output += '<p>' + esc(row.get('current_evidence', '')) + '</p><p>Fuente: ' + esc(', '.join(row['sources'])) + '</p>'
         if row.get('locations'):
             output += '<p>PHP: ' + esc(', '.join(row['locations'])) + '</p>'
         output += '<p>Puede ser: ' + esc(row['hypothesis']) + '</p><p>Qué revisar: ' + esc(row['action']) + '</p>'
+        output += '</article>'
     if result.get('processes'):
         output += '<p>Procesos ACTUALES; captura UTC ' + esc(result['captured']) + '. CPU: 100% = un núcleo. RSS compartida, no sumable como memoria exclusiva.</p>'
         output += api.html_table(('PID', 'CPU % / núcleo', 'RSS MiB'), [(p['pid'], p['cpu'], p['rss_mib']) for p in result['processes']['processes']])
-    output += '<p>' + esc(' '.join(result['notes'])) + '</p><p>Ausencia de avisos no descarta problemas; cobertura adicional parcial.</p>'
+    output += '<p>Lectura parcial; mensajes repetidos entre fuentes no son incidentes únicos.</p>'
+    output += '<details><summary>Ver cobertura del diagnóstico</summary><p>' + esc(' '.join(result['notes'])) + '</p></details>'
     return output

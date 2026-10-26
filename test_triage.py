@@ -337,6 +337,61 @@ class TriageTests(unittest.TestCase):
             a.show_attention([('example.com',r)],a.SharedIncidents())
         self.assertEqual(output.getvalue(),'')
 
+    def test_brief_domain_puts_actionable_issues_before_traffic_and_omits_noise(self):
+        r=result(); r.update(peak=18, peak_minute='2026-10-26 08:37 +0100', unique_ips={'all':(40,False)},
+            urls=collections.Counter({'/cocina/':17}), bytes_urls=collections.Counter({'/file.pdf':1048576}),
+            errors=collections.Counter({'403 /cocina/':17}), f2b_matches=0,
+            watch_history=dict(events=[],sessions=[],gaps=[],message='No hay vigilancia'))
+        snapshot=self.snapshot()
+        for message in ['server reached max_children setting (10)']*3 + ['Undefined array key']*486:
+            t.add_log(snapshot['logs'],'example.com',t.log_signal(message),'2026-10-26T08:00:00+01:00','fpm/error.log')
+        r['triage']=t.diagnose('example.com',r,snapshot,args())
+        output=io.StringIO()
+        with patch.object(a,'triage_module',return_value=t),contextlib.redirect_stdout(output):
+            a.show('example.com',args().day,r,detail=True)
+        text=output.getvalue()
+        self.assertLess(text.index('Avisos: 2'),text.index('TRÁFICO OBSERVADO'))
+        self.assertIn('Empieza por: PHP alcanzó',text)
+        self.assertIn('Qué revisar:',text)
+        self.assertIn('486 mensajes, no peticiones',text)
+        self.assertIn('1.00 MiB',text)
+        self.assertLess(len(text.splitlines()),80)
+        for removed in ('IP Y COMPORTAMIENTO','Códigos HTTP:','DIAGNÓSTICO DEL PERÍODO LEÍDO','INCIDENCIAS GUARDADAS','Sin datos observados','Salud web','Fuente:'):
+            self.assertNotIn(removed,text)
+
+    def test_verbose_keeps_technical_tables_without_repeating_analysis(self):
+        r=result(); r['internal']=collections.Counter()
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output):
+            a.show('example.com',args().day,r,detail=True,verbose=True)
+        self.assertIn('Códigos HTTP:',output.getvalue())
+        with patch.object(a,'ZoneInfo',return_value=dt.timezone.utc):
+            normal=a.arguments(['example.com'])
+            verbose=a.arguments(['example.com','--verbose'])
+        for field in ('seconds','max_mib','run_seconds','cpu_seconds','run_mib'):
+            self.assertEqual(getattr(normal,field),getattr(verbose,field))
+
+    def test_brief_preserves_failure_to_open_sources_without_empty_tables(self):
+        r=result(); r['total']=0; r['read']=0
+        r['notes']={'No se puede abrir logs: Permission denied'}
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output): a.show('example.com',args().day,r,detail=True)
+        self.assertIn('Permission denied',output.getvalue())
+        self.assertNotIn('No se han detectado avisos',output.getvalue())
+        self.assertNotIn('RUTAS MÁS SOLICITADAS',output.getvalue())
+
+    def test_html_prioritizes_issues_and_folds_technical_tables(self):
+        r=result(); snapshot=self.snapshot()
+        t.add_log(snapshot['logs'],'example.com',t.log_signal('server reached max_children setting (10)'),
+                  '2026-10-26T12:00:00+00:00','fpm/error.log')
+        r['triage']=t.diagnose('example.com',r,snapshot,args())
+        opts=args(); opts.verbose=False
+        with patch.object(a,'triage_module',return_value=t): rendered=a.html_section('example.com',r,opts)
+        self.assertLess(rendered.index('Empieza por:'),rendered.index('Ver tráfico, códigos HTTP'))
+        self.assertIn('<article class="alta">',rendered)
+        self.assertNotIn('<details open>',rendered)
+        self.assertEqual(rendered.count('<details>'),rendered.count('</details>'))
+
 
 if __name__=='__main__':
     unittest.main()

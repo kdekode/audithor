@@ -1,8 +1,8 @@
-# Audithor 0.13.1
+# Audithor 0.14.0
 
 La 0.13 añade un resumen práctico: **avisos, prioridad y qué revisar en cada dominio**, cruzando errores ya registrados con una muestra breve de procesos actuales. No corrige webs ni desactiva plugins por su cuenta.
 
-La 0.13.1 simplifica la salida: una sola tabla progresiva, sin repetirla ni ordenarla al final. Quita 4xx/5xx y ESTADO de las tablas globales; mantiene los datos de diagnóstico al consultar un dominio. El resumen de atención muestra los motivos en la propia lista, sin repetir descripciones debajo ni añadir bloques vacíos.
+La 0.14 pone primero lo importante: al consultar una web muestra **prioridad, qué se ha visto y qué revisar**, seguido de un resumen corto de tráfico. Las tablas técnicas siguen disponibles con `--verbose`, sin aumentar el análisis ni sus límites. La tabla global se imprime una sola vez.
 
 Creado por **steev anderson**.
 
@@ -40,12 +40,27 @@ Sube también **`audithor_triage.py`** junto a `audithor.py` y `audithor_watch.p
 ```bash
 python3 -I -B audithor.py                         # tabla de dominios, AVISOS y PRIORIDAD
 python3 -I -B audithor.py escaparatedigital.com    # desglose y procesos actuales
+python3 -I -B audithor.py escaparatedigital.com --verbose  # todas las tablas y fuentes técnicas
 python3 -I -B audithor.py ejemplo.com --yesterday  # errores del período, sin procesos de ahora
 ```
 
 Por ejemplo, un pool que alcanza su límite y un fallo repetido al guardar tareas de WordPress pueden dar **2 avisos · ALTA**. Las líneas repetidas se agrupan: veinte mensajes de cron no se convierten en veinte problemas. El consumo actual de CPU del mismo pool se añade como evidencia del aviso de capacidad, sin duplicarlo. No se afirma que el cron causara la carga.
 
 Cada aviso separa evidencia, número de mensajes, primera/última hora observadas, fuente, posible explicación y qué revisar. Si el mensaje incluye archivo PHP y línea, conserva hasta tres ejemplos de nombre y línea, sin la ruta completa ni el mensaje crudo. La prioridad es orientativa; no identifica al culpable de una caída ni confirma un ataque.
+
+### Qué mirar primero
+
+La consulta normal de un dominio se organiza así:
+
+1. **Empieza por:** el problema de mayor prioridad. Cada aviso explica lo observado, las horas y la acción recomendada. No aparece un segundo diagnóstico de «salud OK» al lado de avisos PHP de prioridad alta.
+2. **Procesos actuales:** CPU conjunta del pool y hasta tres PID con al menos 1% de CPU, si existen. No enseña procesos de otros servicios en esta vista.
+3. **Tráfico observado:** peticiones, IP distintas, MiB enviados y máximo leído en un minuto. Hasta tres rutas por peticiones, errores y contenido enviado; omite apartados sin datos.
+
+Se muestra una sola advertencia de lectura parcial. Si faltan fuentes, se indica; no se sustituye un error de permisos por «sin problemas». Fail2Ban aparece solo si hay coincidencias con IP de esta web, y la vigilancia guardada solo si existen sesiones o incidencias. Los totales de bloqueos de todo el servidor y sus jails quedan en `--verbose`.
+
+Con `--verbose` vuelven las fuentes, límites detallados, códigos HTTP, distribución temporal, comportamiento, IP, rankings completos de la vista anterior e historial de vigilancia. **Solo cambia la presentación:** no activa `--full`, no añade tiempo ni bytes, y no se deben confundir los datos técnicos de accesos con un diagnóstico de la salud completa de la web.
+
+El HTML coloca los avisos primero, con prioridad y acción recomendada. La metodología y las tablas técnicas están en paneles desplegables; no requiere JavaScript, conexiones externas ni cambios en las webs. Con `--verbose --report`, las tablas de cada dominio se abren inicialmente.
 
 Se revisan estas fuentes, **sin ejecutarlas ni modificarlas**:
 
@@ -365,7 +380,7 @@ python3 -B -m unittest -q
 
 Hay pruebas locales de fechas, selección de logs, límites, tablas, informes y Fail2Ban. Algunas comprobaciones de permisos y enlaces necesitan Linux. Esto no sustituye comprobar los resultados con los logs de tu servidor.
 
-Para 0.13.1: 161 pruebas, 155 correctas y 6 omitidas porque requieren Linux. Las pendientes comprueban descriptores/enlaces/permisos, permisos de informes, límites reales del kernel/bloqueo/temporizador, entrada bruta, privacidad de `data/` e inotify real. Las pruebas de watch usan SQLite y logs temporales: EOF, rotación, truncamiento, copias repetidas, PHP/SQL/nginx/PHP-FPM, secretos, presión, Ctrl+C, cola llena, SQLite lleno/ocupado, retención y ausencia de logs. El diagnóstico adicional reproduce el caso de dos avisos, filtra por pool y período, respeta zonas horarias, descarta PID reutilizados, limita estructuras y lecturas, y comprueba cobertura parcial, ambas capas, HTML y presión alta. No se han ejecutado pruebas en los dominios del servidor ni consultas a un Fail2Ban real.
+Para 0.14.0: 165 pruebas, 159 correctas y 6 omitidas porque requieren Linux. Las pendientes comprueban descriptores/enlaces/permisos, permisos de informes, límites reales del kernel/bloqueo/temporizador, entrada bruta, privacidad de `data/` e inotify real. Las pruebas de watch usan SQLite y logs temporales: EOF, rotación, truncamiento, copias repetidas, PHP/SQL/nginx/PHP-FPM, secretos, presión, Ctrl+C, cola llena, SQLite lleno/ocupado, retención y ausencia de logs. El diagnóstico adicional reproduce el caso de dos avisos, filtra por pool y período, respeta zonas horarias, descarta PID reutilizados, limita estructuras y lecturas, y comprueba cobertura parcial, ambas capas, HTML y presión alta. No se han ejecutado pruebas en los dominios del servidor ni consultas a un Fail2Ban real.
 
 Comparación local con 0.10.0 sobre 12.000 accesos: ambas versiones leyeron 1.396.357 bytes y encontraron las mismas peticiones. Mediana de tres recorridos: 0,5000 s CPU antes y 0,5469 s después; pico de asignaciones Python de 449,9 a 460,8 KiB. Es una prueba pequeña con una IP repetida, lector adaptado a Windows y pausas/estado del host simulados. No mide RSS ni predice el coste con miles de IP; los topes de estructuras y los límites de ejecución controlan esos casos.
 
