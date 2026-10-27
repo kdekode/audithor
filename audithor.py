@@ -22,6 +22,9 @@ import signal
 import subprocess
 import selectors
 import types
+import http.client
+import ssl
+import socket
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -36,7 +39,7 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.15.0'
+VERSION = '0.16.0'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
@@ -52,12 +55,19 @@ BAN = re.compile(r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?\s+fail2ba
 WORKLOAD_LABELS = {
     'wp_rocket_preload': 'Precarga de WP Rocket',
     'action_scheduler': 'Cola de Action Scheduler',
+    'admin_ajax': 'Llamadas a admin-ajax.php',
     'wp_cron': 'Llamadas a WP-Cron',
     'wordpress_loopback': 'Peticiones internas de WordPress',
     'amazonbot': 'Amazonbot',
     'geedoshop': 'GeedoShopProductFinder',
+    'bingbot': 'Bingbot',
+    'barkrowler': 'Barkrowler',
+    'claudebot': 'ClaudeBot',
+    'forestengine': 'ForestEngine',
+    'semrushbot': 'SemrushBot',
     'plesk_screenshot': 'Capturas automáticas de Plesk',
 }
+BOT_WORKLOAD_KEYS = {'amazonbot', 'geedoshop', 'bingbot', 'barkrowler', 'claudebot', 'forestengine', 'semrushbot'}
 
 
 def clean(value, limit=180):
@@ -104,8 +114,9 @@ def parse(line, zone):
         # "probable" se conserva como clave interna para compatibilidad; solo apariencia.
         kind = ('bot' if BOT.search(ua) or AUTO.search(ua) else
                 'probable' if BROWSER.search(ua) else 'unknown')
+        method = m[3].decode('ascii')
         return (stamp.date(), path, int(m[5]), int(m[6]) if m[6] != b'-' else 0, kind,
-                ip, stamp.strftime('%Y-%m-%d %H:%M %z'))
+                ip, stamp.strftime('%Y-%m-%d %H:%M %z'), method)
     except (ValueError, KeyError, UnicodeError, OverflowError):
         return None
 
@@ -126,12 +137,19 @@ def workload_signals(line):
     if path == b'/wp-admin/admin-ajax.php' and re.search(
             rb'(?:[?&])action=as_async_request_queue_runner(?:&|$)', target):
         found.append('action_scheduler')
+    if path == b'/wp-admin/admin-ajax.php':
+        found.append('admin_ajax')
     if agent.startswith(b'wordpress/'):
         found.append('wordpress_loopback')
     if b'amazonbot' in agent:
         found.append('amazonbot')
     if b'geedoshopproductfinder' in agent:
         found.append('geedoshop')
+    for marker, key in ((b'bingbot', 'bingbot'), (b'barkrowler', 'barkrowler'),
+                        (b'claudebot', 'claudebot'), (b'forestengine', 'forestengine'),
+                        (b'semrushbot', 'semrushbot')):
+        if marker in agent:
+            found.append(key)
     if b'plesk screenshot bot' in agent or b'pleskbot' in agent:
         found.append('plesk_screenshot')
     return tuple(found)
@@ -1188,6 +1206,35 @@ DYNAMIC_PATH = re.compile(r'\.php(?:/|$)|^/wp-json(?:/|$)|^/(?:api|cart|checkout
 SATURATION = ('Límite de procesos PHP-FPM', 'Límite de Apache', 'Límite de conexiones backend')
 
 
+def request_class(path):
+    """Clasificación orientativa; una URL amigable de WordPress suele acabar en PHP."""
+    if STATIC_PATH.search(path):
+        return 'static'
+    if DYNAMIC_PATH.search(path) or not re.search(r'/[^/?]+\.[A-Za-z0-9]{1,8}$', path):
+        return 'dynamic'
+    return 'unknown'
+
+
+def add_minute_context(state, minute, path, status, method, category):
+    """Contexto acotado por minuto para relacionar accesos con errores internos."""
+    if minute not in state['minute_context']:
+        if len(state['minute_context']) >= 1600 * state['period_days']:
+            state['notes'].add('Contexto por minuto parcial: se alcanzó el límite temporal.')
+            return
+        state['minute_context'][minute] = dict(total=0, methods=collections.Counter(),
+                                               classes=collections.Counter(), codes=collections.Counter(),
+                                               routes=collections.Counter(), routes_partial=False)
+    row = state['minute_context'][minute]
+    row['total'] += 1
+    row['methods'][method] += 1
+    row['classes'][category] += 1
+    row['codes'][status] += 1
+    if path in row['routes'] or len(row['routes']) < 16:
+        row['routes'][path] += 1
+    else:
+        row['routes_partial'] = True
+
+
 def timing_seconds(line):
     """Solo sufijo explícito request_time=SEGUNDOS; nunca adivinar columnas numéricas."""
     if b'request_time=' not in line:
@@ -1536,6 +1583,8 @@ def _analyze(root, domain, day, zone, args):
                  errors=collections.Counter(), statuses=collections.Counter(),
                  internal=collections.Counter(),
                  error_clients=collections.Counter(), error_minutes={}, fourxx_hints=collections.Counter(),
+                 methods=collections.Counter(), request_classes=collections.Counter(), minute_context={},
+                 timing_routes={},
                  timing_count=0, slow_count=0, timing_sum=0.0, timing_max=0.0,
                  ip_counts=collections.Counter(), minutes=collections.Counter(), sensitive_urls=collections.Counter(),
                  f2b_seen=set(), sensitive=0, sensitive4=0, http4=0, http5=0, peak=0, peak_minute=None,
@@ -1595,7 +1644,7 @@ def _analyze(root, domain, day, zone, args):
                     if event is None:
                         state['invalid'] += 1
                         continue
-                    date, path, status, size, kind, ip, minute = event
+                    date, path, status, size, kind, ip, minute, method = event
                     state['earliest'] = min(date, state['earliest'] or date)
                     state['latest'] = max(date, state['latest'] or date)
                     if not start_day <= date <= day:
@@ -1604,6 +1653,9 @@ def _analyze(root, domain, day, zone, args):
                     state['bytes'] += size
                     state['counts'][kind] += 1
                     state['statuses'][status] += 1
+                    state['methods'][method] += 1
+                    category = request_class(path)
+                    state['request_classes'][category] += 1
                     state['http4'] += int(400 <= status < 500)
                     state['http5'] += int(status >= 500)
                     for signal in workload_signals(line):
@@ -1640,6 +1692,7 @@ def _analyze(root, domain, day, zone, args):
                     # Un día tiene <=1500 minutos con cambio horario; límite defensivo.
                     if minute in state['minutes'] or len(state['minutes']) < 1600 * period_days:
                         state['minutes'][minute] += 1
+                        add_minute_context(state, minute, path, status, method, category)
                         if state['minutes'][minute] > state['peak']:
                             state['peak'] = state['minutes'][minute]
                             state['peak_minute'] = minute
@@ -1651,14 +1704,20 @@ def _analyze(root, domain, day, zone, args):
                     else:
                         state['notes'].add('Límite de minutos: distribución temporal y correlación parciales.')
                     if 400 <= status < 500:
-                        hint = 'dynamic' if DYNAMIC_PATH.search(path) else 'static' if STATIC_PATH.search(path) else 'unknown'
-                        state['fourxx_hints'][hint] += 1
+                        state['fourxx_hints'][category] += 1
                     duration = timing_seconds(line)
                     if duration is not None:
                         state['timing_count'] += 1
                         state['slow_count'] += int(duration >= getattr(args, 'thresholds', THRESHOLDS)['slow_seconds'])
                         state['timing_sum'] += duration
                         state['timing_max'] = max(state['timing_max'], duration)
+                        if path in state['timing_routes'] or len(state['timing_routes']) < 2000:
+                            timing = state['timing_routes'].setdefault(path, [0, 0.0, 0.0])
+                            timing[0] += 1
+                            timing[1] += duration
+                            timing[2] = max(timing[2], duration)
+                        else:
+                            state['notes'].add('Tiempos por ruta parciales: máximo 2000 rutas.')
                     if bans and ip in bans['ips']:
                         state['f2b_seen'].add(ip)
                     if detailed:
@@ -1775,6 +1834,18 @@ def show_brief(domain, day, result):
               (' · ' + result['peak_minute'] if result.get('peak_minute') else ''))
     else:
         print('  N/D: no se encontraron accesos suficientes del período; no significa tráfico cero.')
+    if result.get('total'):
+        classes = result.get('request_classes', {})
+        methods = result.get('methods', {})
+        print('  Tipo orientativo: ' +
+              f'{classes.get("dynamic", 0):,} dinámicas/potencialmente PHP · '
+              f'{classes.get("static", 0):,} estáticas · {classes.get("unknown", 0):,} sin clasificar')
+        print('  Métodos: ' + ', '.join(f'{name} {count:,}' for name, count in methods.most_common(5)))
+    if result.get('timing_count'):
+        count = result['timing_count']
+        print(f'  Duración explícita disponible en {count:,} peticiones: '
+              f'media {result["timing_sum"]/count:.3f} s · máxima {result["timing_max"]:.3f} s · '
+              f'{result.get("slow_count", 0):,} lentas según umbral.')
     workloads = collections.Counter(result.get('workloads', {}))
     if workloads:
         print('\n  ACTIVIDAD DE FONDO IDENTIFICADA · los grupos pueden solaparse')
@@ -1798,6 +1869,13 @@ def show_brief(domain, day, result):
         print('\n  RESPUESTAS INDIVIDUALES MÁS GRANDES · tamaño indicado por el log')
         for path, count in largest:
             print(textwrap.fill(f'{count/1048576:.2f} MiB · {path}', width=88, initial_indent='    ', subsequent_indent='      '))
+    timed = sorted(result.get('timing_routes', {}).items(), key=lambda item: (-item[1][2], -item[1][1]))[:3]
+    if timed:
+        print('\n  RUTAS MÁS LENTAS · solo cuando el log incluye request_time')
+        for path, values in timed:
+            print(textwrap.fill(f'máx {values[2]:.3f} s · media {values[1]/values[0]:.3f} s · '
+                                f'{values[0]:,} muestras · {path}', width=88,
+                                initial_indent='    ', subsequent_indent='      '))
     matches = result.get('f2b_matches')
     if matches:
         print(f'\n  Fail2Ban: {matches} IP de esta lectura aparecen en eventos Ban del período.')
@@ -1896,6 +1974,17 @@ def show(domain, day, result, detail=False, verbose=False):
         print('\n  Minutos con más errores (no toda la distribución)\n')
         table(('MINUTO', '4xx', '5xx', '502/503/504', 'PETICIONES'),
               [(m, e[0], e[1], e[2], result['minutes'][m]) for m, e in temporal_rows], (28, 7, 7, 12, 12))
+        print('\n  Métodos y tipo orientativo de petición\n')
+        table(('GRUPO', 'VALOR', 'PETICIONES'),
+              [('Método', key, value) for key, value in result.get('methods', {}).most_common()] +
+              [('Tipo', key, value) for key, value in result.get('request_classes', {}).most_common()],
+              (14, 30, 14))
+        timed = sorted(result.get('timing_routes', {}).items(), key=lambda item: (-item[1][2], -item[1][1]))[:10]
+        if timed:
+            print('\n  Rutas con mayor duración explícita (request_time)\n')
+            table(('MUESTRAS', 'MÁX S', 'MEDIA S', 'RUTA'),
+                  [(v[0], f'{v[2]:.3f}', f'{v[1]/v[0]:.3f}', path) for path, v in timed],
+                  (10, 10, 10, 43))
         for title, key, unit in [('URLs con más peticiones', 'urls', 'PETICIONES'),
                                  ('URLs con más transferencia acumulada (no mide CPU)', 'bytes_urls', 'BYTES'),
                                  ('Respuestas individuales más grandes observadas', 'largest_urls', 'BYTES'),
@@ -1940,6 +2029,7 @@ def compact_summary(result):
     for key in ('unique_ips', 'observed_days', 'coverage', 'suspect_requests', 'indeterminate_requests', 'behavior_partial', 'suspect_ip_count'):
         summary[key] = result.get(key)
     summary['counts'] = collections.Counter({key: result['counts'][key] for key in ('bot', 'probable', 'unknown')})
+    summary['workloads'] = collections.Counter(result.get('workloads', {}))
     notes = sorted(result['notes'])
     summary['notes'] = [clean(note, 240) for note in notes[:8]]
     if len(notes) > 8:
@@ -1961,7 +2051,7 @@ def traffic_key(row):
 
 
 OVERVIEW_COLUMNS = (
-    ('DOMINIO', 32), ('PETICIONES', 10), ('MiB', 9), ('IP ÚNICAS', 10), ('BOTS %', 7),
+    ('DOMINIO', 32), ('CPU AHORA', 18), ('PETICIONES', 10), ('MiB', 9), ('IP ÚNICAS', 10), ('BOTS %', 7),
     ('NAV. %', 7), ('DESC. %', 7), ('MÁX. PET/MIN', 12), ('AVISOS', 6), ('PRIORIDAD', 11),
     ('QUÉ REVISAR PRIMERO', 30),
 )
@@ -1990,7 +2080,10 @@ def show_overview_row(domain, result):
     notice_count = str(triage['count']) + ('*' if triage.get('partial') else '') if triage else 'N/D'
     issues = triage.get('issues') or []
     first_issue = issues[0].get('title', '-') if issues else ('-' if triage else 'Diagnóstico no disponible')
-    print(overview_line((domain, f'{total:,}' if known and total else 'N/D',
+    pool = triage.get('processes')
+    cpu = (f"{pool.get('cpu_min', pool['cpu']):.0f}–{pool.get('cpu_max', pool['cpu']):.0f}% ({pool['cpu']/100:.1f} CPU)"
+           if pool else 'N/D sin proceso')
+    print(overview_line((domain, cpu, f'{total:,}' if known and total else 'N/D',
                          f'{result["bytes"]/1048576:.2f}' if known and total else 'N/D',
                          unique_text((result.get('unique_ips') or {}).get('all')) if total else 'N/D',
                          percent('bot'), percent('probable'), percent('unknown'),
@@ -2090,6 +2183,16 @@ def html_section(domain, result, args):
     output += '<h3>Actividad de fondo identificada</h3>' + html_table(
         ('Señal', 'Peticiones', 'Primera', 'Última'), workload_rows)
     output += '<p>Los grupos pueden solaparse. Identifican rutas o agentes declarados; no miden por sí solos CPU ni prueban causalidad.</p>'
+    output += '<h3>Métodos y tipo orientativo</h3>' + html_table(
+        ('Grupo', 'Valor', 'Peticiones'),
+        [('Método', key, value) for key, value in result.get('methods', {}).most_common()] +
+        [('Tipo', key, value) for key, value in result.get('request_classes', {}).most_common()])
+    timed = sorted(result.get('timing_routes', {}).items(), key=lambda item: (-item[1][2], -item[1][1]))[:20]
+    if timed:
+        output += '<h3>Rutas con mayor duración explícita</h3>' + html_table(
+            ('Ruta', 'Muestras', 'Máximo s', 'Media s'),
+            [(path, values[0], f'{values[2]:.3f}', f'{values[1]/values[0]:.3f}') for path, values in timed])
+        output += '<p>Solo aparece cuando el formato del log incluye request_time; ausencia no significa respuestas rápidas.</p>'
     output += '<h3>Rutas sensibles: posibles exposiciones primero</h3>' + html_table(
         ('Ruta', 'Total', '200', '401', '403', '404', 'Otros', 'IP y conteo', 'Revisión'), sensitive_rows(result))
     output += '<p>HTTP 200 no verifica contenido: posibles errores personalizados/front controller. No se descarga nada. Hasta 64 rutas y primeras 8 IP por ruta; ranking parcial si se rebasa el límite.</p>'
@@ -2196,6 +2299,21 @@ class HtmlAudit:
                        'Fechas locales de Fail2Ban sin offset; se presupone la zona elegida.</p>')
             self.write(html_table(('Jail', 'Eventos observados'), bans['jails'].most_common(20)))
             self.write('<ul>' + ''.join('<li>' + html.escape(clean(n, 500)) + '</li>' for n in sorted(bans['notes'])) + '</ul>')
+        snapshot = getattr(args, 'triage_snapshot', None) or {}
+        pressure = snapshot.get('pressure')
+        if pressure:
+            self.write('<h2>CPU actual del servidor</h2><p>' + html.escape(
+                f"CPU ocupada {pressure['busy']:.1f}% · libre {pressure['idle']:.1f}% · "
+                f"ejecutables {pressure['runnable']} · carga {pressure['load1']:.2f}/{pressure['cpus']} CPU lógicas") + '</p>')
+        pools = snapshot.get('processes', {})
+        domains = getattr(args, 'domains', sorted(pools))
+        self.write('<h3>CPU PHP-FPM por web · tres capturas durante 2 s</h3>' + html_table(
+            ('Web', 'CPU observada', 'CPU media', 'Procesos'),
+            [(domain,
+              f"{pools[domain].get('cpu_min', pools[domain]['cpu']):.1f}–{pools[domain].get('cpu_max', pools[domain]['cpu']):.1f}%" if domain in pools else 'N/D: sin proceso medido',
+              f"{pools[domain]['cpu'] / 100:.2f} CPU" if domain in pools else 'N/D',
+              pools[domain]['count'] if domain in pools else 'N/D') for domain in domains]))
+        self.write('<p>100% equivale a un núcleo. N/D no significa cero: no hubo un proceso estable de ese pool durante la ventana.</p>')
         self.write('</details>')
 
     def write(self, text, closing=False):
@@ -2228,6 +2346,18 @@ class HtmlAudit:
             footer += '<p>Hipótesis para investigar servicios comunes; no demuestra un aumento ni una causa compartida. Solo dominios de esta ejecución/servidor.</p>'
         if shared and shared.partial:
             footer += '<p>Correlación parcial por límites: 2048 minutos, 8 dominios/grupo.</p>'
+        workloads = collections.Counter()
+        for _, result in rows:
+            workloads.update(result.get('workloads', {}))
+        if workloads:
+            declared_bots = sum(result.get('counts', {}).get('bot', 0) for _, result in rows)
+            named_bots = sum(workloads.get(key, 0) for key in BOT_WORKLOAD_KEYS)
+            workload_rows = [(WORKLOAD_LABELS.get(key, key), count) for key, count in workloads.most_common()]
+            if declared_bots > named_bots:
+                workload_rows.append(('Otros bots/automatización declarada no desglosada', declared_bots - named_bots))
+            footer += '<h3>ACTIVIDAD IDENTIFICADA EN TODAS LAS WEBS</h3>' + html_table(
+                ('Actividad', 'Peticiones'), workload_rows)
+            footer += '<p>Los grupos pueden solaparse; son solicitudes observadas, no CPU ni procesos simultáneos.</p>'
         footer += '<p>Hasta 100 dominios destacados y 20 coincidencias; muestras pueden ocultar problemas. CPU/RSS de procesos solo en la instantánea actual; no son métricas históricas ni memoria exclusiva.</p></section></body></html>'
         self.write(footer, closing=True)
         self.stream.close()
@@ -2292,6 +2422,18 @@ def collect_ranked(root, domains, day, zone, args):
     print(f'\nRecorrido: {len(rows)}/{len(domains)} dominios consultados.')
     if len(rows) < len(domains):
         print(f'{len(domains) - len(rows)} dominios pendientes; no están incluidos en el resumen.')
+    workload_totals = collections.Counter()
+    for _, result in rows:
+        workload_totals.update(result.get('workloads', {}))
+    if workload_totals:
+        print('\nACTIVIDAD IDENTIFICADA EN TODAS LAS WEBS · los grupos pueden solaparse')
+        for key, count in workload_totals.most_common():
+            print(f'  {count:,} peticiones · {WORKLOAD_LABELS.get(key, key)}')
+        declared_bots = sum(result.get('counts', {}).get('bot', 0) for _, result in rows)
+        named_bots = sum(workload_totals.get(key, 0) for key in BOT_WORKLOAD_KEYS)
+        if declared_bots > named_bots:
+            print(f'  {declared_bots - named_bots:,} peticiones · otros bots/automatización declarada no desglosada')
+        print('  Son peticiones observadas en los logs, no procesos simultáneos ni CPU atribuida.')
     return rows
 
 
@@ -2315,11 +2457,17 @@ def arguments(argv=None):
     parser.add_argument('--fail2ban-active', action='store_true', help='Consultar status actual de jails mediante cliente local; solo lectura, opcional')
     parser.add_argument('--fail2ban-log', default='/var/log/fail2ban.log', help='Archivo de historial Fail2Ban, sin modificarlo')
     parser.add_argument('--report', action='store_true', help='Guardar HTML local de todos los dominios; usa --full para ampliar la lectura')
-    parser.add_argument('--seconds', type=int, default=5, help='Segundos por dominio en vista rápida; por tanda con --full (1–1800)')
-    parser.add_argument('--max-mib', type=int, default=8, help='MiB descomprimidos por dominio; por tanda con --full (1–1024)')
+    parser.add_argument('--seconds', type=int, default=8, help='Segundos por dominio en vista rápida; por tanda con --full (1–1800)')
+    parser.add_argument('--max-mib', type=int, default=16, help='MiB descomprimidos por dominio; por tanda con --full (1–1024)')
     parser.add_argument('--once', action='store_true', help=f'Analizar únicamente la primera tanda de {PAGE_SIZE} dominios')
     parser.add_argument('--diagnose', action='store_true', help='Mostrar carga, CPU lógicas y memoria; sin analizar dominios')
     parser.add_argument('--resources', action='store_true', help='Solo instantánea ACTUAL de carga, memoria, PSI, OOM acumulado y procesos; sin logs históricos')
+    parser.add_argument('--cache', '--cache-check', dest='cache_check', action='store_true',
+                        help='Con un dominio alojado aquí, realizar 3 GET HTTPS y mostrar TTFB/cabeceras de caché; genera tráfico real')
+    parser.add_argument('--cache-path', action='append', default=[], metavar='/RUTA/',
+                        help='Ruta para --cache; repetible. Si se omite, prueba /')
+    parser.add_argument('--backend-port', type=int, default=7081,
+                        help='Puerto HTTPS interno de Plesk para la prueba directa (predeterminado 7081)')
     parser.add_argument('--threshold', action='append', default=[], metavar='NOMBRE=VALOR',
                         help='Ajustar un umbral de diagnóstico; repetible. Valores predeterminados al final de esta ayuda')
     parser.add_argument('--inspect-logs', action='store_true', help='Con un dominio, mostrar archivos y fechas de extractos pequeños, sin tráfico privado')
@@ -2335,7 +2483,8 @@ def arguments(argv=None):
     if not 1 <= args.watch_seconds <= 3600:
         parser.error('--watch-seconds fuera de rango.')
     if args.watch and (not args.domain or args.full or args.yesterday or args.date or args.week or args.gzip or
-                       args.report or args.diagnose or args.resources or args.inspect_logs or args.fail2ban_active or args.once):
+                       args.report or args.diagnose or args.resources or args.inspect_logs or args.fail2ban_active or
+                       args.cache_check or args.once):
         parser.error('--watch requiere un solo dominio y no admite históricos, --full, --report, diagnósticos ni Fail2Ban activo.')
     if not (1 <= args.run_seconds <= 3600 and 1 <= args.cpu_seconds <= 120 and 1 <= args.run_mib <= 2048):
         parser.error('Límites globales fuera de rango.')
@@ -2370,6 +2519,18 @@ def arguments(argv=None):
     args.sample = not args.full
     if args.inspect_logs and not args.domain:
         parser.error('--inspect-logs requiere indicar un dominio.')
+    if args.cache_check and not args.domain:
+        parser.error('--cache-check requiere indicar un dominio.')
+    if args.cache_path and not args.cache_check:
+        parser.error('--cache-path solo se usa junto con --cache.')
+    if args.cache_check and (args.full or args.yesterday or args.date or args.week or args.report or
+                             args.diagnose or args.resources or args.inspect_logs or args.fail2ban_active):
+        parser.error('--cache es una prueba independiente y no se combina con análisis de logs, informes o fechas.')
+    if not 1 <= args.backend_port <= 65535:
+        parser.error('--backend-port fuera de rango.')
+    for path in args.cache_path:
+        if not re.fullmatch(r'/[A-Za-z0-9._~!$&()*+,;=:@%/?-]{0,500}', path):
+            parser.error('--cache-path debe ser una ruta relativa segura que empiece por /.')
     if args.domain and not DOMAIN.fullmatch(args.domain):
         parser.error('Dominio no válido. Usa su nombre ASCII exacto, sin URL ni rutas.')
     if not 1 <= args.seconds <= 1800 or not 1 <= args.max_mib <= 1024:
@@ -2485,6 +2646,155 @@ def saved_history(args):
         return dict(events=[], sessions=[], gaps=[], message='Vigilancia guardada no disponible; no implica ausencia de errores.')
 
 
+def read_http_body(response, maximum=16 * 1048576):
+    total = 0
+    while total <= maximum:
+        chunk = response.read(min(65536, maximum + 1 - total))
+        if not chunk:
+            return total, False
+        total += len(chunk)
+    return maximum, True
+
+
+def cache_headers(response):
+    headers = {key.lower(): value.strip() for key, value in response.getheaders()
+               if key.lower() in ('x-cache-status', 'cf-cache-status', 'age', 'cache-control', 'vary',
+                                  'content-encoding', 'content-type', 'server', 'x-powered-by',
+                                  'strict-transport-security', 'content-security-policy',
+                                  'x-content-type-options', 'x-frame-options', 'referrer-policy')}
+    cookies = []
+    for value in response.headers.get_all('Set-Cookie', []):
+        name = value.split('=', 1)[0].strip()
+        if re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', name) and name not in cookies:
+            cookies.append(name)
+    if cookies:
+        headers['set-cookie'] = ', '.join(cookies[:10])
+    return headers
+
+
+def https_probe(domain, path, address=None, port=443, no_cache=False):
+    context = ssl.create_default_context()
+    if address:
+        # El backend local de Plesk puede usar una cadena interna; no sale de loopback.
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    started = time.monotonic()
+    connection = raw = None
+    try:
+        headers = {'Host': domain, 'User-Agent': 'Audithor-Cache-Check/0.16',
+                   'Accept': 'text/html,*/*;q=0.1', 'Accept-Encoding': 'identity', 'Connection': 'close'}
+        if no_cache:
+            headers['Cache-Control'] = 'no-cache'
+        if address:
+            raw = socket.create_connection((address, port), timeout=15)
+            connection = context.wrap_socket(raw, server_hostname=domain)
+            request = f'GET {path} HTTP/1.1\r\n' + ''.join(f'{key}: {value}\r\n' for key, value in headers.items()) + '\r\n'
+            connection.sendall(request.encode('ascii'))
+            response = http.client.HTTPResponse(connection)
+            response.begin()
+        else:
+            connection = http.client.HTTPSConnection(domain, port, timeout=15, context=context)
+            connection.request('GET', path, headers=headers)
+            response = connection.getresponse()
+        ttfb = time.monotonic() - started
+        selected = cache_headers(response)
+        size, truncated = read_http_body(response)
+        total = time.monotonic() - started
+        return dict(status=response.status, ttfb=ttfb, total=total, size=size,
+                    truncated=truncated, headers=selected, error=None)
+    except (OSError, ssl.SSLError, http.client.HTTPException, ValueError) as exc:
+        return dict(error=clean(str(exc), 180))
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+
+def cache_recommendations(direct, public):
+    notes = []
+    good = [row for row in public if not row.get('error')]
+    statuses = [(row.get('headers', {}).get('x-cache-status') or
+                 row.get('headers', {}).get('cf-cache-status', '')).upper() for row in good]
+    if 'HIT' in statuses[1:] or ('HIT' in statuses and len(statuses) == 1):
+        notes.append('BIEN: nginx devuelve HIT en peticiones públicas repetidas.')
+    elif statuses and all(value == 'MISS' for value in statuses):
+        notes.append('REVISAR: todas las peticiones públicas fueron MISS; comprobar cookies, exclusiones y clave de caché.')
+    elif not any(statuses):
+        notes.append('INDETERMINADO: no se recibió X-Cache-Status; la caché puede no exponer su estado.')
+    if good and max(row['ttfb'] for row in good[-2:]) > 1:
+        notes.append('REVISAR: el TTFB público sigue por encima de 1 s incluso en las últimas peticiones.')
+    if direct and not direct.get('error') and direct['ttfb'] > 1:
+        notes.append('REVISAR ORIGEN: la respuesta directa sin nginx tarda más de 1 s; investigar PHP, base de datos y llamadas externas.')
+    headers = good[-1].get('headers', {}) if good else {}
+    cache_control = headers.get('cache-control', '').lower()
+    if 'private' in cache_control or 'no-store' in cache_control:
+        notes.append('REVISAR: Cache-Control impide o restringe la caché pública.')
+    if headers.get('set-cookie'):
+        notes.append('REVISAR: el HTML anónimo emite cookies (' + headers['set-cookie'] + '); pueden reducir aciertos de caché.')
+    if good and not headers.get('strict-transport-security'):
+        notes.append('OPCIONAL: no se observó HSTS en la respuesta final.')
+    if good and not headers.get('x-content-type-options'):
+        notes.append('RECOMENDADO: añadir X-Content-Type-Options: nosniff si no lo establece otra capa.')
+    if good and not headers.get('x-frame-options') and 'frame-ancestors' not in headers.get('content-security-policy', '').lower():
+        notes.append('RECOMENDADO: definir X-Frame-Options o frame-ancestors para controlar iframes.')
+    if headers.get('x-powered-by'):
+        notes.append('OPCIONAL: ocultar X-Powered-By para reducir información técnica expuesta; no mejora el rendimiento.')
+    if headers.get('cf-cache-status', '').upper() == 'DYNAMIC' and headers.get('x-cache-status', '').upper() == 'HIT':
+        notes.append('BIEN: Cloudflare deja el HTML como DYNAMIC, pero la caché nginx del servidor responde HIT.')
+    if any(300 <= row.get('status', 0) < 400 for row in good):
+        notes.append('REVISAR: una ruta respondió con redirección. Audithor no la siguió ni la mezcló con el destino.')
+    if not notes:
+        notes.append('SIN CAMBIOS RECOMENDADOS con estas cabeceras y tiempos; conserva la medición para comparar.')
+    return notes
+
+
+def run_cache_check(args):
+    root = directory(args.root)
+    child = None
+    try:
+        child = directory(args.domain, root)
+    except OSError as exc:
+        raise RuntimeError('El dominio no pertenece a esta raíz de Plesk o no es accesible: ' + clean(exc.strerror)) from exc
+    finally:
+        if child is not None:
+            os.close(child)
+        os.close(root)
+    paths = args.cache_path or ['/']
+    print('Audithor ' + VERSION + ' · PRUEBA EXPLÍCITA DE CACHÉ')
+    print('Genera 4 GET por ruta: uno directo al backend y tres públicos. No sigue redirecciones.')
+    print('La primera petición pública no garantiza MISS si la caché ya estaba caliente; no se purga ni modifica nada.')
+    print('Petición controlada: Host del dominio, User-Agent Audithor, Accept HTML, identidad sin compresión y Connection close; solo DIRECTO añade Cache-Control: no-cache.')
+    for path in paths:
+        print('\n' + args.domain + path)
+        direct = https_probe(args.domain, path, address='127.0.0.1', port=args.backend_port, no_cache=True)
+        public = []
+        for attempt in range(3):
+            public.append(https_probe(args.domain, path))
+            if attempt < 2:
+                time.sleep(.5)
+        rows = []
+        for label, result in [('DIRECTO', direct)] + [(f'PÚBLICO {n}', value) for n, value in enumerate(public, 1)]:
+            if result.get('error'):
+                rows.append((label, 'ERROR', 'N/D', 'N/D', 'N/D', result['error']))
+                continue
+            headers = result['headers']
+            cache = headers.get('x-cache-status') or headers.get('cf-cache-status') or 'N/D'
+            size = ('>' if result['truncated'] else '') + f'{result["size"]/1048576:.2f} MiB'
+            rows.append((label, result['status'], f'{result["ttfb"]:.3f} s', f'{result["total"]:.3f} s', size, cache))
+        table(('PRUEBA', 'HTTP', 'TTFB', 'TOTAL', 'HTML', 'CACHÉ'), rows, (12, 7, 11, 11, 12, 22))
+        final = next((row for row in reversed(public) if not row.get('error')), None)
+        if final:
+            print('  Cabeceras relevantes de la última respuesta pública:')
+            for key, value in final['headers'].items():
+                print(textwrap.fill(f'{key}: {value}', width=96, initial_indent='    ', subsequent_indent='      '))
+        print('  Resultado recomendado:')
+        for note in cache_recommendations(direct, public):
+            print(textwrap.fill(note, width=96, initial_indent='    - ', subsequent_indent='      '))
+    return 0
+
+
 def main(argv=None):
     args = arguments(argv)
     if getattr(args, 'watch', False):
@@ -2494,6 +2804,8 @@ def main(argv=None):
 
 
 def guarded_main(args):
+    if getattr(args, 'cache_check', False):
+        return run_cache_check(args)
     if getattr(args, 'resources', False):
         if not hasattr(os, 'O_NOFOLLOW'):
             raise RuntimeError('--resources requiere Linux.')
@@ -2553,6 +2865,7 @@ def run_analysis(args):
             inspect_logs(root, args)
             return 0
         domains = [args.domain] if args.domain else discover(root)
+        args.domains = list(domains)
         if not domains:
             print('No se encontraron dominios accesibles.')
             return 0

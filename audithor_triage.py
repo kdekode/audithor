@@ -315,6 +315,55 @@ def process_delta(before, after, ticks, page_size):
     return pools
 
 
+def merge_pool_intervals(*intervals):
+    """Une intervalos breves y conserva mínimo/máximo, sin convertirlos en histórico."""
+    names = set().union(*(set(interval) for interval in intervals))
+    merged = {}
+    for name in names:
+        values = [interval[name] for interval in intervals if name in interval]
+        cpus = [value['cpu'] for value in values]
+        processes = {}
+        for value in values:
+            for row in value['processes']:
+                previous = processes.get(row['pid'])
+                if previous is None or row['cpu'] > previous['cpu']:
+                    processes[row['pid']] = row
+        merged[name] = dict(count=max(value['count'] for value in values),
+                            cpu=round(sum(cpus) / len(cpus), 1),
+                            cpu_min=round(min(cpus), 1), cpu_max=round(max(cpus), 1),
+                            processes=sorted(processes.values(), key=lambda row: (-row['cpu'], row['pid']))[:10])
+    return merged
+
+
+def host_cpu_sample(api, reader, proc='/proc'):
+    root = None
+    try:
+        root = api.directory(proc)
+        stat_data = reader.get(root, 'stat', 16384).decode('ascii', 'replace')
+        load_data = reader.get(root, 'loadavg', 256).decode('ascii', 'replace').strip()
+        cpu_line = next(line for line in stat_data.splitlines() if line.startswith('cpu '))
+        values = [int(value) for value in cpu_line.split()[1:11]]
+        running = re.search(r'^procs_running\s+(\d+)$', stat_data, re.M)
+        load = load_data.split()
+        runnable = int(load[3].split('/', 1)[0]) if len(load) >= 4 and '/' in load[3] else int(running[1])
+        return dict(total=sum(values), idle=values[3], iowait=values[4] if len(values) > 4 else 0,
+                    runnable=runnable, load1=float(load[0]))
+    finally:
+        if root is not None:
+            os.close(root)
+
+
+def host_cpu_delta(first, last, cpus, elapsed):
+    total = last['total'] - first['total']
+    if total <= 0:
+        raise ValueError('Contadores CPU sin avance')
+    idle = 100 * (last['idle'] - first['idle']) / total
+    iowait = 100 * (last['iowait'] - first['iowait']) / total
+    return dict(busy=round(max(0.0, 100.0 - idle), 1), idle=round(max(0.0, idle), 1),
+                iowait=round(max(0.0, iowait), 1), runnable=last['runnable'],
+                load1=last['load1'], cpus=cpus, seconds=round(elapsed, 2))
+
+
 def capture(args, api, domains):
     selected = set(domains[:MAX_DOMAINS])
     result = dict(logs={}, processes={}, notes=[], captured=dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),
@@ -344,27 +393,36 @@ def capture(args, api, domains):
     result['notes'].extend(logs['notes'])
     result['partial'] |= logs['partial']
     if args.start_day == args.day == dt.datetime.now(args.zone).date():
-        reader = Reader(api, seconds=2, maximum=1048576)
+        reader = Reader(api, seconds=5, maximum=2 * 1048576)
         try:
             ticks = os.sysconf('SC_CLK_TCK')
             page_size = os.sysconf('SC_PAGE_SIZE')
+            cpu_first = host_cpu_sample(api, reader)
             first = process_sample(api, reader, selected)
             if first:
-                # Pausa única, no monitor continuo; revalidar la presión antes de repetir.
-                time.sleep(.5)
+                # Tres capturas en dos segundos: permite mostrar un rango sin monitorizar continuamente.
+                time.sleep(1)
                 cpus, loads, available = api.host_status()
                 if available < 256 or loads[0] > max(4, cpus * 2):
                     raise ValueError('Presión durante instantánea')
                 second = process_sample(api, reader, selected)
-                if set(first) != set(second):
+                time.sleep(1)
+                third = process_sample(api, reader, selected)
+                cpu_second = host_cpu_sample(api, reader)
+                if set(first) != set(third):
                     reader.partial = True
-                result['processes'] = process_delta(first, second, ticks, page_size)
+                result['processes'] = merge_pool_intervals(
+                    process_delta(first, second, ticks, page_size),
+                    process_delta(second, third, ticks, page_size))
                 result['server'] = result['processes'].pop('__server__', None)
+                elapsed = max((item['sampled'] for item in third.values()), default=time.monotonic()) - \
+                          min((item['sampled'] for item in first.values()), default=time.monotonic())
+                result['pressure'] = host_cpu_delta(cpu_first, cpu_second, cpus, elapsed)
         except (OSError, ValueError, AttributeError):
             reader.partial = True
         result['partial'] |= reader.partial
         result['read'] += reader.read
-        result['notes'].append('CPU ACTUAL: dos muestras separadas por al menos 0,5 s; 100% equivale a un núcleo. Solo PID presentes en ambas; muestra breve, no carga sostenida.')
+        result['notes'].append('CPU ACTUAL: tres capturas durante 2 s; se muestra media y rango de dos intervalos. 100% equivale a un núcleo; no es carga sostenida.')
     else:
         result['notes'].append('Procesos actuales omitidos en consultas históricas o semanales; CPU/RAM históricas por dominio N/D.')
     result['read'] += logs['read']
@@ -399,6 +457,9 @@ def workload_issue(key, count, window, api):
         'action_scheduler': (20, 100, 'Ejecuciones de Action Scheduler',
             'Se observaron llamadas al runner asíncrono. Pueden proceder de WooCommerce u otros plugins y solaparse con peticiones internas de WordPress.',
             'Revisar en WordPress la cola pendiente y sus hooks principales; no cancelar tareas sin identificar su origen.'),
+        'admin_ajax': (100, 500, 'Muchas llamadas a admin-ajax.php',
+            'admin-ajax.php ejecuta WordPress y puede consumir PHP incluso para visitantes anónimos; el contador incluye acciones distintas.',
+            'Cruzar el intervalo con plugins y acciones AJAX en los logs; optimizar o limitar únicamente la acción identificada.'),
         'wp_cron': (20, 100, 'Muchas llamadas a WP-Cron',
             'Se observaron peticiones a wp-cron.php. El log no permite saber qué tarea se ejecutó ni cuánto consumió.',
             'Revisar frecuencia y tareas; en Plesk valorar cron real con DISABLE_WP_CRON tras comprobar que no exista ya.'),
@@ -411,6 +472,21 @@ def workload_issue(key, count, window, api):
         'geedoshop': (100, None, 'Tráfico de GeedoShopProductFinder',
             'GeedoShopProductFinder se identificó en el User-Agent. Puede generar volumen, pero el log no demuestra CPU consumida.',
             'Revisar rutas y frecuencia; si no es necesario, limitarlo en nginx y comprobar con un User-Agent normal.'),
+        'bingbot': (200, None, 'Tráfico elevado de Bingbot',
+            'Bingbot aparece en el User-Agent; el nombre declarado no verifica la identidad ni el coste de las respuestas.',
+            'Revisar rutas, códigos y bytes. Confirmar IP si se plantea limitarlo y evitar bloquear indexación útil.'),
+        'barkrowler': (100, None, 'Tráfico elevado de Barkrowler',
+            'Barkrowler aparece en el User-Agent y puede rastrear muchas URLs.',
+            'Si no aporta valor, limitar su frecuencia en nginx o robots y medir el resultado.'),
+        'claudebot': (100, None, 'Tráfico elevado de ClaudeBot',
+            'ClaudeBot aparece en el User-Agent; el contador no demuestra por sí solo presión de CPU.',
+            'Revisar rutas y frecuencia antes de decidir su política en robots o nginx.'),
+        'forestengine': (100, None, 'Tráfico elevado de ForestEngine',
+            'ForestEngine aparece en el User-Agent y genera rastreo identificado.',
+            'Revisar utilidad, rutas y frecuencia; limitarlo solo si el volumen y el coste lo justifican.'),
+        'semrushbot': (100, None, 'Tráfico elevado de SemrushBot',
+            'SemrushBot aparece en el User-Agent y puede generar rastreo intenso.',
+            'Si no se usa Semrush para este dominio, valorar limitar su frecuencia tras revisar rutas y coste.'),
         'plesk_screenshot': (50, None, 'Capturas automáticas de Plesk frecuentes',
             'Se observó el agente de capturas de Plesk. Normalmente es administrativo, pero una frecuencia alta merece revisión.',
             'Revisar la frecuencia de generación de miniaturas o capturas en Plesk.'),
@@ -427,6 +503,57 @@ def workload_issue(key, count, window, api):
                 evidence=f'{count} peticiones identificadas{period}.', count=None,
                 first=None, last=None, sources=['accesos del dominio'], service='web/WordPress',
                 hypothesis=hypothesis, action=action)
+
+
+def access_correlation(issue, result):
+    """Relaciona mensajes internos y accesos por minuto sin afirmar causalidad."""
+    try:
+        first = dt.datetime.fromisoformat(issue['first']).replace(second=0, microsecond=0)
+        last = dt.datetime.fromisoformat(issue['last']).replace(second=0, microsecond=0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    margin_first, margin_last = first - dt.timedelta(minutes=1), last + dt.timedelta(minutes=1)
+    selected = []
+    for label, row in result.get('minute_context', {}).items():
+        try:
+            stamp = dt.datetime.strptime(label, '%Y-%m-%d %H:%M %z')
+        except ValueError:
+            continue
+        if margin_first <= stamp <= margin_last:
+            selected.append((stamp, row))
+    if not selected:
+        return dict(text='No hay accesos leídos en el minuto del aviso ni en el margen de ±1 minuto.', routes=[])
+    total = sum(row['total'] for _, row in selected)
+    methods, classes, routes = collections.Counter(), collections.Counter(), collections.Counter()
+    partial = False
+    for _, row in selected:
+        methods.update(row['methods'])
+        classes.update(row['classes'])
+        routes.update(row['routes'])
+        partial |= row.get('routes_partial', False)
+    method_text = ', '.join(f'{key} {value}' for key, value in methods.most_common(4)) or 'N/D'
+    class_text = (f'dinámicas/potencialmente PHP {classes.get("dynamic", 0)}, '
+                  f'estáticas {classes.get("static", 0)}, sin clasificar {classes.get("unknown", 0)}')
+    text = f'{total} accesos leídos entre {selected[0][0].strftime("%H:%M")} y {selected[-1][0].strftime("%H:%M")}; {method_text}; {class_text}.'
+    if partial:
+        text += ' Ranking de rutas parcial.'
+    return dict(text=text, routes=routes.most_common(3))
+
+
+def peak_relation(issue, result):
+    peak = result.get('peak_minute')
+    if not peak:
+        return None
+    try:
+        stamp = dt.datetime.strptime(peak, '%Y-%m-%d %H:%M %z')
+        first = dt.datetime.fromisoformat(issue['first']).replace(second=0, microsecond=0)
+        last = dt.datetime.fromisoformat(issue['last']).replace(second=0, microsecond=0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if first - dt.timedelta(minutes=1) <= stamp <= last + dt.timedelta(minutes=1):
+        return f'El pico leído ({result.get("peak", 0)} peticiones/min a las {stamp.strftime("%H:%M")}) coincide temporalmente con el aviso; esto no prueba causalidad.'
+    delta = min(abs((stamp - first).total_seconds()), abs((stamp - last).total_seconds())) / 60
+    return f'El pico leído ({result.get("peak", 0)} peticiones/min a las {stamp.strftime("%H:%M")}) NO coincide con el aviso; está separado aproximadamente {delta:.0f} minutos.'
 
 
 def diagnose(domain, result, snapshot, args, api=None):
@@ -450,11 +577,22 @@ def diagnose(domain, result, snapshot, args, api=None):
             capacity = dict(key='process_cpu', title='Consumo actual de CPU en PHP-FPM', priority='ALTA' if pool['cpu'] >= 100 else 'MEDIA',
                             evidence='', count=None, first=None, last=None, sources=['/proc'], service='PHP-FPM', hypothesis=hypothesis, action=action)
             issues.append(capacity)
-        capacity['current_evidence'] = f"{pool['count']} procesos medidos; CPU conjunta {pool['cpu']:.1f}% de un núcleo, captura {snapshot['captured']}. No son procesos necesariamente ocupados ni duración de peticiones."
+        capacity['current_evidence'] = (f"{pool['count']} procesos medidos; CPU media {pool['cpu']:.1f}% "
+                                        f"(rango {pool.get('cpu_min', pool['cpu']):.1f}–{pool.get('cpu_max', pool['cpu']):.1f}%), "
+                                        f"captura {snapshot['captured']}. No mide duración de peticiones.")
     for key, count in result.get('workloads', {}).items():
         issue = workload_issue(key, count, result.get('workload_windows', {}).get(key), api)
         if issue:
             issues.append(issue)
+    for issue in issues:
+        if issue.get('first'):
+            context = access_correlation(issue, result)
+            if context:
+                issue['access_context'] = context['text']
+                issue['context_routes'] = context['routes']
+            relation = peak_relation(issue, result)
+            if relation:
+                issue['peak_relation'] = relation
     d = result.get('diagnosis') or {}
     for yes, key, title, priority, evidence, hypothesis, action in (
         (d.get('health') in ('REVISAR', 'CRÍTICO'), 'http5', 'Respuestas HTTP de error del servidor',
@@ -477,12 +615,20 @@ def diagnose(domain, result, snapshot, args, api=None):
     issues = sorted(issues, key=lambda row: (-LEVEL[row['priority']], row['key']))[:MAX_ISSUES]
     known = bool(result.get('read') or pool or snapshot.get('logs', {}).get(domain))
     priority = max((row['priority'] for row in issues), key=LEVEL.get) if issues else 'SIN AVISOS' if known else 'SIN DATOS'
+    dominant = None
+    pools = snapshot.get('processes', {})
+    if pools:
+        name, values = max(pools.items(), key=lambda item: item[1].get('cpu', 0))
+        if values.get('cpu', 0) >= 50:
+            dominant = dict(domain=name, cpu=values['cpu'], cpu_min=values.get('cpu_min', values['cpu']),
+                            cpu_max=values.get('cpu_max', values['cpu']), count=values['count'])
     return dict(issues=issues, count=len(issues), priority=priority, processes=pool,
+                server_pressure=snapshot.get('pressure'), dominant_pool=dominant,
                 captured=snapshot.get('captured'), notes=list(snapshot.get('notes', [])), partial=snapshot.get('partial', True))
 
 
 def show(result, api, verbose=False):
-    if not result['issues'] and not result.get('processes'):
+    if not result['issues'] and not result.get('processes') and not result.get('server_pressure'):
         return
     print('\n  RESUMEN PARA REVISAR · avisos agrupados por problema')
     print(f"  Avisos: {result['count']} | Prioridad: {result['priority']}")
@@ -500,6 +646,12 @@ def show(result, api, verbose=False):
         say('Qué se ha visto: ', row['evidence'])
         if row['count'] is not None:
             say('Cuándo: ', f"{clock(row['first'])} a {clock(row['last'])} · {row['count']} mensajes, no peticiones.")
+        if row.get('access_context'):
+            say('Accesos cercanos: ', row['access_context'])
+            for path, count in row.get('context_routes', []):
+                say('Ruta cercana: ', f'{count} peticiones · {path}')
+        if row.get('peak_relation'):
+            say('Pico de tráfico: ', row['peak_relation'])
         if row.get('current_evidence') and verbose:
             say('AHORA: ', row['current_evidence'])
         if verbose:
@@ -511,11 +663,24 @@ def show(result, api, verbose=False):
     pool = result.get('processes')
     if pool:
         print('\n  PROCESOS ACTUALES · captura UTC ' + result['captured'])
-        print(f"  {pool['count']} procesos medidos; CPU conjunta {pool['cpu']:.1f}% (100% = un núcleo).")
+        print(f"  {pool['count']} procesos medidos; CPU media {pool['cpu']:.1f}% · "
+              f"rango {pool.get('cpu_min', pool['cpu']):.1f}–{pool.get('cpu_max', pool['cpu']):.1f}% (100% = un núcleo).")
         rows = pool['processes'] if verbose else [p for p in pool['processes'] if p['cpu'] >= 1][:3]
         if rows:
             api.table(('PID', 'CPU %', 'RSS MiB'), [(p['pid'], p['cpu'], p['rss_mib']) for p in rows], (10, 10, 12))
             print('  RSS = memoria residente, incluye páginas compartidas; no sumar como RAM exclusiva.')
+    pressure = result.get('server_pressure')
+    if pressure:
+        print('\n  SERVIDOR AHORA · medida global, no atribuida a esta web')
+        print(f"  CPU ocupada {pressure['busy']:.1f}% · libre {pressure['idle']:.1f}% · "
+              f"espera E/S {pressure['iowait']:.1f}% · ejecutables {pressure['runnable']} · "
+              f"carga 1 min {pressure['load1']:.2f} / {pressure['cpus']} CPU lógicas.")
+        if pressure['idle'] <= 5 or pressure['runnable'] > pressure['cpus']:
+            print('  PRESIÓN ALTA: la captura encontró CPU saturada o cola superior a las CPU disponibles.')
+    dominant = result.get('dominant_pool')
+    if dominant:
+        print(f"  Pool PHP con más CPU: {dominant['domain']} · media {dominant['cpu']:.1f}% · "
+              f"rango {dominant['cpu_min']:.1f}–{dominant['cpu_max']:.1f}% · {dominant['count']} procesos.")
     if verbose:
         for note in result['notes']:
             say('Cobertura: ', note)
@@ -523,7 +688,7 @@ def show(result, api, verbose=False):
 
 
 def render_html(result, api):
-    if not result['issues'] and not result.get('processes'):
+    if not result['issues'] and not result.get('processes') and not result.get('server_pressure'):
         return ''
     esc = html.escape
     output = '<h3>Resumen para revisar</h3><p>Avisos: ' + str(result['count']) + ' · Prioridad: ' + esc(result['priority']) + '</p>'
@@ -533,14 +698,31 @@ def render_html(result, api):
         output += '<article class="' + esc(row['priority'].lower(), quote=True) + '"><h4>' + esc(row['title'] + ' · ' + row['priority']) + '</h4><p>Qué se ha visto: ' + esc(row['evidence']) + '</p>'
         if row['count'] is not None:
             output += '<p>' + esc(f"{row['count']} mensajes, no peticiones; {row['first']} a {row['last']}") + '</p>'
+        if row.get('access_context'):
+            output += '<p>Accesos cercanos: ' + esc(row['access_context']) + '</p><ul>' + ''.join(
+                '<li>' + esc(f'{count} peticiones · {path}') + '</li>' for path, count in row.get('context_routes', [])) + '</ul>'
+        if row.get('peak_relation'):
+            output += '<p>Pico de tráfico: ' + esc(row['peak_relation']) + '</p>'
         output += '<p>' + esc(row.get('current_evidence', '')) + '</p><p>Fuente: ' + esc(', '.join(row['sources'])) + '</p>'
         if row.get('locations'):
             output += '<p>PHP: ' + esc(', '.join(row['locations'])) + '</p>'
         output += '<p>Puede ser: ' + esc(row['hypothesis']) + '</p><p>Qué revisar: ' + esc(row['action']) + '</p>'
         output += '</article>'
     if result.get('processes'):
-        output += '<p>Procesos ACTUALES; captura UTC ' + esc(result['captured']) + '. CPU: 100% = un núcleo. RSS compartida, no sumable como memoria exclusiva.</p>'
+        pool = result['processes']
+        output += '<p>Procesos ACTUALES; captura UTC ' + esc(result['captured']) + '. CPU media ' + esc(f"{pool['cpu']:.1f}%") + \
+                  ' · rango ' + esc(f"{pool.get('cpu_min', pool['cpu']):.1f}–{pool.get('cpu_max', pool['cpu']):.1f}%") + \
+                  '. 100% = un núcleo. RSS compartida, no sumable como memoria exclusiva.</p>'
         output += api.html_table(('PID', 'CPU % / núcleo', 'RSS MiB'), [(p['pid'], p['cpu'], p['rss_mib']) for p in result['processes']['processes']])
+    pressure = result.get('server_pressure')
+    if pressure:
+        output += '<p>Servidor durante la captura: ' + esc(
+            f"CPU ocupada {pressure['busy']:.1f}% · libre {pressure['idle']:.1f}% · ejecutables {pressure['runnable']} · "
+            f"carga {pressure['load1']:.2f}/{pressure['cpus']} CPU lógicas") + '.</p>'
+    dominant = result.get('dominant_pool')
+    if dominant:
+        output += '<p>Pool PHP con más CPU: ' + esc(
+            f"{dominant['domain']} · {dominant['cpu_min']:.1f}–{dominant['cpu_max']:.1f}% · media {dominant['cpu']:.1f}%") + '.</p>'
     output += '<p>Lectura parcial; mensajes repetidos entre fuentes no son incidentes únicos.</p>'
     output += '<details><summary>Ver cobertura del diagnóstico</summary><p>' + esc(' '.join(result['notes'])) + '</p></details>'
     return output
