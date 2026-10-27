@@ -584,6 +584,19 @@ def diagnose(domain, result, snapshot, args, api=None):
         issue = workload_issue(key, count, result.get('workload_windows', {}).get(key), api)
         if issue:
             issues.append(issue)
+    known_bot_families = {'amazonbot', 'geedoshopproductfinder', 'bingbot', 'barkrowler',
+                          'claudebot', 'forestengine', 'semrushbot'}
+    generic_bots = [(family, count) for family, count in result.get('bot_families', {}).items()
+                    if family not in known_bot_families and count >= 100]
+    for family, count in sorted(generic_bots, key=lambda item: (-item[1], item[0]))[:3]:
+        window = result.get('bot_windows', {}).get(family) or []
+        period = f' entre {window[0]} y {window[1]}' if len(window) == 2 else ''
+        label = api.clean(family, 72) if api else family[:72]
+        issues.append(dict(key='bot_family_' + label, title='Rastreo elevado: ' + label,
+                           priority='MEDIA', evidence=f'{count} peticiones identificadas{period}.',
+                           count=None, first=None, last=None, sources=['accesos del dominio'], service='web/bot',
+                           hypothesis='El User-Agent declara esta familia automatizada; no verifica su identidad ni cuánto CPU consumió.',
+                           action='Revisar sus rutas, códigos, bytes y frecuencia. Limitarla solo si no aporta valor y tras medir el resultado.'))
     for issue in issues:
         if issue.get('first'):
             context = access_correlation(issue, result)

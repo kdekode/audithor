@@ -39,11 +39,11 @@ BANNER = r"""
 DOMAIN = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOAD_PER_CPU = 1.0
 PAGE_SIZE = 70
-VERSION = '0.16.0'
+VERSION = '0.16.1'
 ACCESS = re.compile(rb'^(\S+) \S+ \S+ \[([^\]]+)\] "([A-Z]+) ([^" ]+) HTTP/[0-9.]+" ([1-5][0-9]{2}) (\d+|-) "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
 MONTHS = {m: i+1 for i, m in enumerate(('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'))}
 STAMP = re.compile(r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$')
-BOT = re.compile(r'bot|crawler|spider|slurp|bingpreview', re.I)
+BOT = re.compile(r'bot|crawler|spider|slurp|preview|fetcher|scraper|monitor|validator|archive|externalhit', re.I)
 AUTO = re.compile(r'curl|wget|python|sqlmap|nikto|go-http-client|headless|selenium', re.I)
 BROWSER = re.compile(r'Mozilla/5\.0.*(?:Firefox/|Chrome/|Safari/|Edg/)', re.I)
 SENSITIVE = re.compile(r'(?:^|/)(?:\.env|\.git|wp-login\.php|xmlrpc\.php|phpmyadmin)(?:[/.]|$)', re.I)
@@ -68,6 +68,7 @@ WORKLOAD_LABELS = {
     'plesk_screenshot': 'Capturas automáticas de Plesk',
 }
 BOT_WORKLOAD_KEYS = {'amazonbot', 'geedoshop', 'bingbot', 'barkrowler', 'claudebot', 'forestengine', 'semrushbot'}
+BOT_TOKEN = re.compile(rb'([a-z0-9][a-z0-9._-]{0,50}(?:bot|crawler|spider|slurp|preview|fetcher|scraper|monitor|validator|archive|externalhit)[a-z0-9._-]{0,20})', re.I)
 
 
 def clean(value, limit=180):
@@ -153,6 +154,32 @@ def workload_signals(line):
     if b'plesk screenshot bot' in agent or b'pleskbot' in agent:
         found.append('plesk_screenshot')
     return tuple(found)
+
+
+def bot_family(line):
+    """Nombre acotado del agente automatizado; nunca conserva el User-Agent completo."""
+    match = ACCESS.match(line)
+    if not match:
+        return None
+    agent = match[7]
+    token = BOT_TOKEN.search(agent)
+    if token:
+        value = token[1].decode('ascii', 'ignore').strip('._-').lower()
+        for prefix, canonical in (('amazonbot', 'amazonbot'), ('geedoshopproductfinder', 'geedoshopproductfinder'),
+                                  ('bingbot', 'bingbot'), ('barkrowler', 'barkrowler'),
+                                  ('claudebot', 'claudebot'), ('forestengine', 'forestengine'),
+                                  ('semrushbot', 'semrushbot')):
+            if value.startswith(prefix):
+                value = canonical
+                break
+        return clean(value, 72) if value else 'bot no identificado'
+    low = agent.lower()
+    for marker, label in ((b'curl', 'curl'), (b'wget', 'wget'), (b'python', 'python-http'),
+                          (b'go-http-client', 'go-http-client'), (b'headless', 'navegador headless'),
+                          (b'selenium', 'selenium'), (b'sqlmap', 'sqlmap'), (b'nikto', 'nikto')):
+        if marker in low:
+            return label
+    return 'automatización no identificada' if AUTO.search(agent.decode('utf-8', 'replace')) else None
 
 
 def directory(path, start=None):
@@ -1580,6 +1607,7 @@ def _analyze(root, domain, day, zone, args):
     state = dict(inodes=set(), notes=set(), counts=collections.Counter(), urls=collections.Counter(),
                  bytes_urls=collections.Counter(), largest_urls=collections.Counter(),
                  workloads=collections.Counter(), workload_windows={},
+                 bot_families=collections.Counter(), bot_windows={},
                  errors=collections.Counter(), statuses=collections.Counter(),
                  internal=collections.Counter(),
                  error_clients=collections.Counter(), error_minutes={}, fourxx_hints=collections.Counter(),
@@ -1652,6 +1680,14 @@ def _analyze(root, domain, day, zone, args):
                     state['total'] += 1
                     state['bytes'] += size
                     state['counts'][kind] += 1
+                    if kind == 'bot':
+                        family = bot_family(line) or 'bot no identificado'
+                        if family not in state['bot_families'] and len(state['bot_families']) >= 128:
+                            family = '[otros bots: límite de memoria]'
+                        state['bot_families'][family] += 1
+                        window = state['bot_windows'].setdefault(family, [minute, minute])
+                        window[0] = min(window[0], minute)
+                        window[1] = max(window[1], minute)
                     state['statuses'][status] += 1
                     state['methods'][method] += 1
                     category = request_class(path)
@@ -1847,12 +1883,22 @@ def show_brief(domain, day, result):
               f'media {result["timing_sum"]/count:.3f} s · máxima {result["timing_max"]:.3f} s · '
               f'{result.get("slow_count", 0):,} lentas según umbral.')
     workloads = collections.Counter(result.get('workloads', {}))
-    if workloads:
+    background = [(key, count) for key, count in workloads.most_common() if key not in BOT_WORKLOAD_KEYS]
+    if background:
         print('\n  ACTIVIDAD DE FONDO IDENTIFICADA · los grupos pueden solaparse')
-        for key, count in workloads.most_common(7):
+        for key, count in background[:7]:
             window = result.get('workload_windows', {}).get(key) or []
             period = f' · {window[0]} a {window[1]}' if len(window) == 2 else ''
             print(f'    {count:,} peticiones · {WORKLOAD_LABELS.get(key, key)}{period}')
+    bots = collections.Counter(result.get('bot_families', {}))
+    if bots:
+        print('\n  BOTS Y AUTOMATIZACIÓN DECLARADA · nombre extraído del User-Agent')
+        for family, count in bots.most_common(12):
+            window = result.get('bot_windows', {}).get(family) or []
+            period = f' · {window[0]} a {window[1]}' if len(window) == 2 else ''
+            print(f'    {count:,} peticiones · {family}{period}')
+        if len(bots) > 12:
+            print(f'    {len(bots) - 12} familias adicionales; usa --verbose para el detalle completo.')
     for title, key in (('RUTAS MÁS SOLICITADAS', 'urls'), ('RUTAS CON ERRORES', 'errors')):
         rows = result.get(key, collections.Counter()).most_common(3)
         if rows:
@@ -2030,6 +2076,7 @@ def compact_summary(result):
         summary[key] = result.get(key)
     summary['counts'] = collections.Counter({key: result['counts'][key] for key in ('bot', 'probable', 'unknown')})
     summary['workloads'] = collections.Counter(result.get('workloads', {}))
+    summary['bot_families'] = collections.Counter(result.get('bot_families', {}))
     notes = sorted(result['notes'])
     summary['notes'] = [clean(note, 240) for note in notes[:8]]
     if len(notes) > 8:
@@ -2178,11 +2225,20 @@ def html_section(domain, result, args):
                          [(ip_label(r['ip']), r['requests'], r['browser'], r['peak'], r['reasons']) for r in result.get('behavior', [])])
     workload_rows = []
     for key, count in collections.Counter(result.get('workloads', {})).most_common():
+        if key in BOT_WORKLOAD_KEYS:
+            continue
         window = result.get('workload_windows', {}).get(key) or ('N/D', 'N/D')
         workload_rows.append((WORKLOAD_LABELS.get(key, key), count, window[0], window[1]))
     output += '<h3>Actividad de fondo identificada</h3>' + html_table(
         ('Señal', 'Peticiones', 'Primera', 'Última'), workload_rows)
     output += '<p>Los grupos pueden solaparse. Identifican rutas o agentes declarados; no miden por sí solos CPU ni prueban causalidad.</p>'
+    bot_rows = []
+    for family, count in collections.Counter(result.get('bot_families', {})).most_common():
+        window = result.get('bot_windows', {}).get(family) or ('N/D', 'N/D')
+        bot_rows.append((family, count, window[0], window[1]))
+    output += '<h3>Bots y automatización declarada</h3>' + html_table(
+        ('Familia extraída', 'Peticiones', 'Primera', 'Última'), bot_rows)
+    output += '<p>Se detecta cualquier token reconocible del User-Agent, con límite de cardinalidad. El nombre declarado no verifica la identidad real.</p>'
     output += '<h3>Métodos y tipo orientativo</h3>' + html_table(
         ('Grupo', 'Valor', 'Peticiones'),
         [('Método', key, value) for key, value in result.get('methods', {}).most_common()] +
@@ -2349,15 +2405,19 @@ class HtmlAudit:
         workloads = collections.Counter()
         for _, result in rows:
             workloads.update(result.get('workloads', {}))
-        if workloads:
-            declared_bots = sum(result.get('counts', {}).get('bot', 0) for _, result in rows)
-            named_bots = sum(workloads.get(key, 0) for key in BOT_WORKLOAD_KEYS)
-            workload_rows = [(WORKLOAD_LABELS.get(key, key), count) for key, count in workloads.most_common()]
-            if declared_bots > named_bots:
-                workload_rows.append(('Otros bots/automatización declarada no desglosada', declared_bots - named_bots))
+        workload_rows = [(WORKLOAD_LABELS.get(key, key), count) for key, count in workloads.most_common()
+                         if key not in BOT_WORKLOAD_KEYS]
+        if workload_rows:
             footer += '<h3>ACTIVIDAD IDENTIFICADA EN TODAS LAS WEBS</h3>' + html_table(
                 ('Actividad', 'Peticiones'), workload_rows)
             footer += '<p>Los grupos pueden solaparse; son solicitudes observadas, no CPU ni procesos simultáneos.</p>'
+        bot_totals = collections.Counter()
+        for _, result in rows:
+            bot_totals.update(result.get('bot_families', {}))
+        if bot_totals:
+            footer += '<h3>BOTS DETECTADOS EN TODAS LAS WEBS</h3>' + html_table(
+                ('Familia extraída del User-Agent', 'Peticiones'), bot_totals.most_common())
+            footer += '<p>Detección genérica y acotada. El nombre declarado no verifica la identidad real del bot.</p>'
         footer += '<p>Hasta 100 dominios destacados y 20 coincidencias; muestras pueden ocultar problemas. CPU/RSS de procesos solo en la instantánea actual; no son métricas históricas ni memoria exclusiva.</p></section></body></html>'
         self.write(footer, closing=True)
         self.stream.close()
@@ -2427,13 +2487,17 @@ def collect_ranked(root, domains, day, zone, args):
         workload_totals.update(result.get('workloads', {}))
     if workload_totals:
         print('\nACTIVIDAD IDENTIFICADA EN TODAS LAS WEBS · los grupos pueden solaparse')
-        for key, count in workload_totals.most_common():
+        for key, count in ((key, count) for key, count in workload_totals.most_common() if key not in BOT_WORKLOAD_KEYS):
             print(f'  {count:,} peticiones · {WORKLOAD_LABELS.get(key, key)}')
-        declared_bots = sum(result.get('counts', {}).get('bot', 0) for _, result in rows)
-        named_bots = sum(workload_totals.get(key, 0) for key in BOT_WORKLOAD_KEYS)
-        if declared_bots > named_bots:
-            print(f'  {declared_bots - named_bots:,} peticiones · otros bots/automatización declarada no desglosada')
         print('  Son peticiones observadas en los logs, no procesos simultáneos ni CPU atribuida.')
+    bot_totals = collections.Counter()
+    for _, result in rows:
+        bot_totals.update(result.get('bot_families', {}))
+    if bot_totals:
+        print('\nBOTS DETECTADOS EN TODAS LAS WEBS · cualquier familia declarada reconocible')
+        for family, count in bot_totals.most_common():
+            print(f'  {count:,} peticiones · {family}')
+        print('  El nombre procede del User-Agent y no verifica la identidad real del bot.')
     return rows
 
 
@@ -2681,7 +2745,7 @@ def https_probe(domain, path, address=None, port=443, no_cache=False):
     started = time.monotonic()
     connection = raw = None
     try:
-        headers = {'Host': domain, 'User-Agent': 'Audithor-Cache-Check/0.16',
+        headers = {'Host': domain, 'User-Agent': 'Audithor-Cache-Check/' + VERSION,
                    'Accept': 'text/html,*/*;q=0.1', 'Accept-Encoding': 'identity', 'Connection': 'close'}
         if no_cache:
             headers['Cache-Control'] = 'no-cache'
