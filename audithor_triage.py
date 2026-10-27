@@ -88,9 +88,7 @@ def log_signal(text):
     if ('cron' in low and ('could_not_set' in low or 'could not be saved' in low)):
         hook = HOOK.search(text)
         name = hook[1] if hook else 'no identificado'
-        # Los hooks arbitrarios podrían contener identificadores privados: no conservarlos.
-        label = 'sby_feed_update' if name == 'sby_feed_update' else 'otro hook (oculto)'
-        return ('cron', 'Fallo al guardar tareas de WordPress', 'MEDIA', 'WP-Cron: could_not_set; ' + label)
+        return ('cron', 'Fallo al guardar tareas de WordPress', 'MEDIA', 'WP-Cron: could_not_set; hook ' + name)
     if 'undefined array key' in low or 'trying to access array offset on null' in low:
         return ('application_warning', 'Advertencias repetidas en el código de la web', 'MEDIA',
                 'PHP Warning: clave ausente o acceso a un valor nulo; no equivale a peticiones distintas.')
@@ -434,7 +432,7 @@ def explanation(key):
         'pool_limit': ('PHP había ocupado todos los procesos permitidos para esta web. Otras solicitudes podían quedar esperando; no demuestra un ataque.',
                        'Revisar en Plesk los errores PHP y las tareas que coincidían con esas horas. No aumentar el límite sin identificar qué ocupaba los procesos.'),
         'cron': ('WordPress no pudo guardar la lista de tareas. Puede ser un fallo de persistencia o concurrencia; no demuestra que el plugin cause la carga.',
-                 'Revisar el hook y los errores de WordPress/base de datos. sby_feed_update es una pista de YouTube Feed; confirmar el plugin instalado antes de actuar.'),
+                 'Revisar el hook indicado y los errores de WordPress/base de datos; identificar su propietario antes de actuar.'),
         'process_cpu': ('PHP-FPM consumía CPU en el intervalo medido. No identifica la petición, plugin o tarea, ni demuestra ataque.',
                         'Relacionar la hora con accesos y slowlog/estado del pool si ya están disponibles. No reiniciar ni bloquear por esta medición.'),
         'application_warning': ('La aplicación accede a valores ausentes o nulos. Muchos mensajes pueden proceder de una sola petición.',
@@ -450,46 +448,30 @@ def explanation(key):
 
 def workload_issue(key, count, window, api):
     """Convierte contadores cerrados de accesos en una pista, sin afirmar causalidad."""
+    if ':' in key:
+        return None
     rules = {
-        'wp_rocket_preload': (10, 50, 'Precarga de WP Rocket observada',
-            'El agente WP Rocket/Preload solicitó páginas. Una precarga grande puede ocupar PHP-FPM y CPU, como se comprobó en Escaparate Digital.',
-            'Comprobar en WP Rocket si la precarga está activa y comparar el pool antes/después de pausarla.'),
-        'action_scheduler': (20, 100, 'Ejecuciones de Action Scheduler',
-            'Se observaron llamadas al runner asíncrono. Pueden proceder de WooCommerce u otros plugins y solaparse con peticiones internas de WordPress.',
-            'Revisar en WordPress la cola pendiente y sus hooks principales; no cancelar tareas sin identificar su origen.'),
         'admin_ajax': (100, 500, 'Muchas llamadas a admin-ajax.php',
             'admin-ajax.php ejecuta WordPress y puede consumir PHP incluso para visitantes anónimos; el contador incluye acciones distintas.',
-            'Cruzar el intervalo con plugins y acciones AJAX en los logs; optimizar o limitar únicamente la acción identificada.'),
+            'Cruzar el intervalo con las acciones AJAX desglosadas y sus muestras; optimizar o limitar únicamente la acción identificada.'),
         'wp_cron': (20, 100, 'Muchas llamadas a WP-Cron',
             'Se observaron peticiones a wp-cron.php. El log no permite saber qué tarea se ejecutó ni cuánto consumió.',
             'Revisar frecuencia y tareas; en Plesk valorar cron real con DISABLE_WP_CRON tras comprobar que no exista ya.'),
-        'wordpress_loopback': (50, 200, 'Muchas peticiones internas de WordPress',
-            'El User-Agent identifica llamadas HTTP de WordPress a la propia web. Puede incluir cron, colas, precargas u otras integraciones.',
-            'Cruzar las horas y rutas con WP-Cron, Action Scheduler y precargas; los contadores pueden solaparse.'),
-        'amazonbot': (100, None, 'Tráfico de Amazonbot',
-            'Amazonbot se identificó en el User-Agent. El nombre declarado no demuestra el coste de cada respuesta.',
-            'Revisar rutas, códigos y bytes; limitarlo en nginx o robots solo si no aporta valor y la política del sitio lo permite.'),
-        'geedoshop': (100, None, 'Tráfico de GeedoShopProductFinder',
-            'GeedoShopProductFinder se identificó en el User-Agent. Puede generar volumen, pero el log no demuestra CPU consumida.',
-            'Revisar rutas y frecuencia; si no es necesario, limitarlo en nginx y comprobar con un User-Agent normal.'),
-        'bingbot': (200, None, 'Tráfico elevado de Bingbot',
-            'Bingbot aparece en el User-Agent; el nombre declarado no verifica la identidad ni el coste de las respuestas.',
-            'Revisar rutas, códigos y bytes. Confirmar IP si se plantea limitarlo y evitar bloquear indexación útil.'),
-        'barkrowler': (100, None, 'Tráfico elevado de Barkrowler',
-            'Barkrowler aparece en el User-Agent y puede rastrear muchas URLs.',
-            'Si no aporta valor, limitar su frecuencia en nginx o robots y medir el resultado.'),
-        'claudebot': (100, None, 'Tráfico elevado de ClaudeBot',
-            'ClaudeBot aparece en el User-Agent; el contador no demuestra por sí solo presión de CPU.',
-            'Revisar rutas y frecuencia antes de decidir su política en robots o nginx.'),
-        'forestengine': (100, None, 'Tráfico elevado de ForestEngine',
-            'ForestEngine aparece en el User-Agent y genera rastreo identificado.',
-            'Revisar utilidad, rutas y frecuencia; limitarlo solo si el volumen y el coste lo justifican.'),
-        'semrushbot': (100, None, 'Tráfico elevado de SemrushBot',
-            'SemrushBot aparece en el User-Agent y puede generar rastreo intenso.',
-            'Si no se usa Semrush para este dominio, valorar limitar su frecuencia tras revisar rutas y coste.'),
-        'plesk_screenshot': (50, None, 'Capturas automáticas de Plesk frecuentes',
-            'Se observó el agente de capturas de Plesk. Normalmente es administrativo, pero una frecuencia alta merece revisión.',
-            'Revisar la frecuencia de generación de miniaturas o capturas en Plesk.'),
+        'wp_rest': (200, 1000, 'Muchas peticiones a la API REST',
+            'Se observaron llamadas a wp-json. Pueden ser públicas, internas o de una integración; el namespace se desglosa aparte.',
+            'Revisar namespaces, métodos, códigos y agentes de la misma franja antes de limitar una API.'),
+        'xmlrpc': (50, 200, 'Muchas peticiones a XML-RPC',
+            'XML-RPC puede tener usos legítimos o recibir automatización repetitiva.',
+            'Revisar métodos, códigos y agentes; deshabilitar o limitar solo si ninguna integración lo necesita.'),
+        'wp_login': (100, 500, 'Muchas peticiones al acceso de WordPress',
+            'El endpoint de acceso recibió volumen elevado; no todas las peticiones son intentos fallidos.',
+            'Cruzar códigos e IP en el detalle y revisar protecciones existentes antes de añadir bloqueos.'),
+        'admin_post': (100, 500, 'Muchas llamadas a admin-post.php',
+            'admin-post.php ejecuta acciones de WordPress; las acciones concretas aparecen desglosadas.',
+            'Revisar la acción dominante y su origen antes de optimizar o limitar.'),
+        'wc_ajax': (100, 500, 'Muchas llamadas AJAX de WooCommerce',
+            'Las acciones AJAX pueden ser funcionales o repetitivas y ejecutar PHP.',
+            'Revisar la acción dominante, páginas que la generan y tiempos antes de cambiar la configuración.'),
     }
     if key not in rules:
         return None
@@ -521,8 +503,21 @@ def access_correlation(issue, result):
             continue
         if margin_first <= stamp <= margin_last:
             selected.append((stamp, row))
+    nearby_activities = []
+    for row in result.get('activities', {}).values():
+        try:
+            activity_first = dt.datetime.strptime(row['first'], '%Y-%m-%d %H:%M %z')
+            activity_last = dt.datetime.strptime(row['last'], '%Y-%m-%d %H:%M %z')
+        except (KeyError, ValueError):
+            continue
+        if activity_first <= margin_last and activity_last >= margin_first:
+            nearby_activities.append(row)
+    nearby_activities.sort(key=lambda row: (-row['dynamic'], -row['count'], row['label']))
+    activity_labels = [f"{row['label']} ({row['count']} en su ventana; {row['dynamic']} potencialmente PHP)"
+                       for row in nearby_activities[:5]]
     if not selected:
-        return dict(text='No hay accesos leídos en el minuto del aviso ni en el margen de ±1 minuto.', routes=[])
+        return dict(text='No hay accesos leídos en el minuto del aviso ni en el margen de ±1 minuto.',
+                    routes=[], activities=activity_labels)
     total = sum(row['total'] for _, row in selected)
     methods, classes, routes = collections.Counter(), collections.Counter(), collections.Counter()
     partial = False
@@ -537,7 +532,7 @@ def access_correlation(issue, result):
     text = f'{total} accesos leídos entre {selected[0][0].strftime("%H:%M")} y {selected[-1][0].strftime("%H:%M")}; {method_text}; {class_text}.'
     if partial:
         text += ' Ranking de rutas parcial.'
-    return dict(text=text, routes=routes.most_common(3))
+    return dict(text=text, routes=routes.most_common(3), activities=activity_labels)
 
 
 def peak_relation(issue, result):
@@ -584,10 +579,7 @@ def diagnose(domain, result, snapshot, args, api=None):
         issue = workload_issue(key, count, result.get('workload_windows', {}).get(key), api)
         if issue:
             issues.append(issue)
-    known_bot_families = {'amazonbot', 'geedoshopproductfinder', 'bingbot', 'barkrowler',
-                          'claudebot', 'forestengine', 'semrushbot'}
-    generic_bots = [(family, count) for family, count in result.get('bot_families', {}).items()
-                    if family not in known_bot_families and count >= 100]
+    generic_bots = [(family, count) for family, count in result.get('bot_families', {}).items() if count >= 100]
     for family, count in sorted(generic_bots, key=lambda item: (-item[1], item[0]))[:3]:
         window = result.get('bot_windows', {}).get(family) or []
         period = f' entre {window[0]} y {window[1]}' if len(window) == 2 else ''
@@ -597,12 +589,27 @@ def diagnose(domain, result, snapshot, args, api=None):
                            count=None, first=None, last=None, sources=['accesos del dominio'], service='web/bot',
                            hypothesis='El User-Agent declara esta familia automatizada; no verifica su identidad ni cuánto CPU consumió.',
                            action='Revisar sus rutas, códigos, bytes y frecuencia. Limitarla solo si no aporta valor y tras medir el resultado.'))
+    agents = [row for row in result.get('activities', {}).values()
+              if row.get('kind') == 'agent' and (row.get('count', 0) >= 100 or row.get('dynamic', 0) >= 50)]
+    for row in sorted(agents, key=lambda item: (-item['dynamic'], -item['count'], item['label']))[:3]:
+        label = api.clean(row['label'], 72) if api else row['label'][:72]
+        routes = ', '.join(f'{count}× {path}' for path, count in row.get('routes', {}).most_common(3)) or 'sin rutas retenidas'
+        priority = 'ALTA' if row['dynamic'] >= 500 or row['count'] >= 1000 else 'MEDIA'
+        issues.append(dict(key='agent_family_' + label, title='Agente automatizado con actividad elevada: ' + label,
+                           priority=priority,
+                           evidence=(f"{row['count']} peticiones ({row['dynamic']} potencialmente PHP, "
+                                     f"{row['bytes']/1048576:.2f} MiB) entre {row['first']} y {row['last']}. "
+                                     f"Rutas principales: {routes}."),
+                           count=None, first=None, last=None, sources=['accesos del dominio'], service='web/agente',
+                           hypothesis='El producto se extrajo del User-Agent del log. Puede coincidir con carga, pero no mide CPU por petición ni demuestra causalidad.',
+                           action='Revisar las muestras saneadas. Si es prescindible, pausarlo de forma controlada y comparar CPU/TTFB antes y después.'))
     for issue in issues:
         if issue.get('first'):
             context = access_correlation(issue, result)
             if context:
                 issue['access_context'] = context['text']
                 issue['context_routes'] = context['routes']
+                issue['context_activities'] = context.get('activities', [])
             relation = peak_relation(issue, result)
             if relation:
                 issue['peak_relation'] = relation
@@ -663,6 +670,8 @@ def show(result, api, verbose=False):
             say('Accesos cercanos: ', row['access_context'])
             for path, count in row.get('context_routes', []):
                 say('Ruta cercana: ', f'{count} peticiones · {path}')
+            for activity in row.get('context_activities', []):
+                say('Actividad coincidente: ', activity + '. Coincidencia temporal; no prueba consumo de CPU.')
         if row.get('peak_relation'):
             say('Pico de tráfico: ', row['peak_relation'])
         if row.get('current_evidence') and verbose:
@@ -714,6 +723,10 @@ def render_html(result, api):
         if row.get('access_context'):
             output += '<p>Accesos cercanos: ' + esc(row['access_context']) + '</p><ul>' + ''.join(
                 '<li>' + esc(f'{count} peticiones · {path}') + '</li>' for path, count in row.get('context_routes', [])) + '</ul>'
+            if row.get('context_activities'):
+                output += '<p>Actividad coincidente:</p><ul>' + ''.join(
+                    '<li>' + esc(value) + ' · coincidencia temporal, no prueba CPU.</li>'
+                    for value in row['context_activities']) + '</ul>'
         if row.get('peak_relation'):
             output += '<p>Pico de tráfico: ' + esc(row['peak_relation']) + '</p>'
         output += '<p>' + esc(row.get('current_evidence', '')) + '</p><p>Fuente: ' + esc(', '.join(row['sources'])) + '</p>'
